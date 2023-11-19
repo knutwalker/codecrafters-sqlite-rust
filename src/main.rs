@@ -146,7 +146,7 @@ impl Plan<'_> {
                     let (last, init) = columns.split_last().unwrap();
 
                     for &idx in init {
-                        print!("{} ", cell.payload.values[idx]);
+                        print!("{}|", cell.payload.values[idx]);
                     }
                     print!("{}", cell.payload.values[*last]);
 
