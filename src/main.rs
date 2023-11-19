@@ -47,6 +47,21 @@ fn main() -> Result<()> {
             //     println!("page {}: {:#?}", page_id, page);
             // }
         }
+        ".tables" => {
+            let file = File::open(&args[1])?;
+
+            let mut db = Sqlite::new(file)?;
+            let root_page = db.page(0)?;
+
+            for cell in root_page.cells.iter() {
+                let create_table = match cell {
+                    Cell::LeafTable(cell) => CreateTable::from_record(&cell.payload)?,
+                };
+                if matches!(create_table.typ, TableType::Table) {
+                    print!("{} ", create_table.table_name);
+                }
+            }
+        }
         _ => bail!("Missing or invalid command passed: {}", command),
     }
 
