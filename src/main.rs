@@ -1,8 +1,18 @@
 use anyhow::{anyhow, bail, ensure, Result};
+use nom::{
+    branch::alt,
+    bytes::complete::{tag, tag_no_case, take_until1, take_while1},
+    character::complete::{multispace0, multispace1},
+    combinator::{all_consuming, map, opt, value},
+    multi::separated_list1,
+    sequence::{delimited, pair, preceded, terminated, tuple},
+    Finish, IResult,
+};
 use std::{
     borrow::Cow,
     cmp::Reverse,
     ffi::CStr,
+    fmt::Display,
     fs::File,
     io::{Read as _, Seek as _, SeekFrom},
     mem::size_of,
@@ -19,8 +29,8 @@ fn main() -> Result<()> {
     }
 
     // Parse command and act accordingly
-    let command = &args[2];
-    match command.as_str() {
+    let command = args[2].as_str();
+    match command {
         ".dbinfo" => {
             let file = File::open(&args[1])?;
 
@@ -33,7 +43,7 @@ fn main() -> Result<()> {
             let root_page = db.page(0)?;
             for cell in root_page.cells.iter() {
                 let create_table = match cell {
-                    Cell::LeafTable(cell) => CreateTable::from_record(&cell.payload)?,
+                    Cell::LeafTable(cell) => Schema::from_record(&cell.payload)?,
                 };
                 if matches!(create_table.typ, TableType::Table) {
                     num_tables += 1;
@@ -41,11 +51,6 @@ fn main() -> Result<()> {
             }
 
             println!("number of tables: {}", num_tables);
-
-            // for page_id in 0..db.header.db_size {
-            //     let page = db.page(page_id)?;
-            //     println!("page {}: {:#?}", page_id, page);
-            // }
         }
         ".tables" => {
             let file = File::open(&args[1])?;
@@ -55,7 +60,7 @@ fn main() -> Result<()> {
 
             for cell in root_page.cells.iter() {
                 let create_table = match cell {
-                    Cell::LeafTable(cell) => CreateTable::from_record(&cell.payload)?,
+                    Cell::LeafTable(cell) => Schema::from_record(&cell.payload)?,
                 };
                 if matches!(create_table.typ, TableType::Table) {
                     print!("{} ", create_table.table_name);
@@ -63,51 +68,188 @@ fn main() -> Result<()> {
             }
         }
         query => {
-            let table = (|| {
-                let mut query = query.split_whitespace();
-                let _select = query.next().filter(|s| s.eq_ignore_ascii_case("SELECT"))?;
-                let _count = query
-                    .next()
-                    .filter(|s| s.eq_ignore_ascii_case("COUNT(*)"))?;
-                let _from = query.next().filter(|s| s.eq_ignore_ascii_case("FROM"))?;
-
-                query.next()
-            })()
-            .ok_or_else(|| anyhow!("Invalid query: {}", query))?;
+            let plan = parse_query(query)
+                .finish()
+                .map_err(|e| anyhow!("Invalid query: {}", e))?
+                .1;
 
             let file = File::open(&args[1])?;
-
             let mut db = Sqlite::new(file)?;
-            let root_page = db.page(0)?;
 
-            let table_def = root_page
-                .cells
-                .iter()
-                .find_map(|cell| match cell {
-                    Cell::LeafTable(cell) => {
-                        let create_table = match CreateTable::from_record(&cell.payload) {
-                            Ok(create_table) => create_table,
-                            Err(_) => return None,
-                        };
-                        if &*create_table.table_name == table {
-                            Some(create_table)
-                        } else {
-                            None
-                        }
-                    }
-                })
-                .ok_or_else(|| anyhow!("Table not found: {}", table))?;
-
-            let page = db.page(table_def.root_page)?;
-            println!("{}", page.cells.len());
+            plan.execute(&mut db)?;
         }
-    }
+    };
 
     Ok(())
 }
 
+#[derive(Debug)]
+enum Plan<'a> {
+    CountRows {
+        table: &'a str,
+    },
+    SelectColumns {
+        table: &'a str,
+        columns: Vec<&'a str>,
+    },
+}
+
+impl Plan<'_> {
+    fn execute(&self, db: &mut Sqlite) -> Result<()> {
+        let from_table = match self {
+            Plan::CountRows { table } => *table,
+            Plan::SelectColumns { table, .. } => *table,
+        };
+
+        let schema = db
+            .page(0)?
+            .cells
+            .iter()
+            .find_map(|cell| match cell {
+                Cell::LeafTable(cell) => {
+                    let create_table = match Schema::from_record(&cell.payload) {
+                        Ok(create_table) => create_table,
+                        Err(_) => return None,
+                    };
+                    if &*create_table.table_name == from_table {
+                        Some(create_table)
+                    } else {
+                        None
+                    }
+                }
+            })
+            .ok_or_else(|| anyhow!("Table not found: {}", from_table))?;
+
+        match self {
+            Self::CountRows { .. } => {
+                let page = db.page(schema.root_page)?;
+                println!("{}", page.cells.len());
+            }
+            Self::SelectColumns { columns, .. } => {
+                let table_def = TableDef::from_sql(&schema.sql)?;
+
+                let columns = columns
+                    .iter()
+                    .map(|&col| {
+                        table_def
+                            .columns
+                            .iter()
+                            .position(|c| c.name == col)
+                            .ok_or_else(|| anyhow!("Column not found: {}", col))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let page = db.page(schema.root_page)?;
+                page.cells.iter().for_each(|cell| {
+                    let Cell::LeafTable(cell) = cell;
+
+                    let (last, init) = columns.split_last().unwrap();
+
+                    for &idx in init {
+                        print!("{} ", cell.payload.values[idx]);
+                    }
+                    print!("{}", cell.payload.values[*last]);
+
+                    println!();
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_query(query: &str) -> IResult<&str, Plan<'_>> {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum Op<'a> {
+        Count,
+        Select(Vec<&'a str>),
+    }
+
+    all_consuming(map(
+        tuple((
+            terminated(tag_no_case("SELECT"), multispace1),
+            alt((
+                value(Op::Count, tag_no_case("COUNT(*)")),
+                map(
+                    separated_list1(delimited(multispace0, tag(","), multispace0), name),
+                    Op::Select,
+                ),
+            )),
+            delimited(multispace1, tag_no_case("FROM"), multispace1),
+            name,
+        )),
+        |(_, op, _, table)| match op {
+            Op::Count => Plan::CountRows { table },
+            Op::Select(columns) => Plan::SelectColumns { table, columns },
+        },
+    ))(query)
+}
+
+fn parse_create_table_schema(sql: &str) -> IResult<&str, TableDef<'_>> {
+    all_consuming(map(
+        tuple((
+            value(
+                (),
+                pair(
+                    terminated(tag_no_case("CREATE"), multispace1),
+                    terminated(tag_no_case("TABLE"), multispace1),
+                ),
+            ),
+            name,
+            delimited(
+                delimited(multispace0, tag("("), multispace0),
+                separated_list1(delimited(multispace0, tag(","), multispace0), column_def),
+                delimited(multispace0, tag(")"), multispace0),
+            ),
+        )),
+        |(_, name, columns)| TableDef { name, columns },
+    ))(sql)
+}
+
+fn name(s: &str) -> IResult<&str, &str> {
+    take_while1(|c: char| c.is_ascii_alphanumeric() || c == '_')(s)
+}
+
+fn column_def(s: &str) -> IResult<&str, ColumnDef<'_>> {
+    map(
+        tuple((
+            name,
+            opt(preceded(multispace1, name)),
+            value((), opt(take_until1(","))),
+        )),
+        |(name, typ, constraints)| ColumnDef {
+            name,
+            typ,
+            constraints,
+        },
+    )(s)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CreateTable {
+struct TableDef<'a> {
+    name: &'a str,
+    columns: Vec<ColumnDef<'a>>,
+}
+
+impl<'a> TableDef<'a> {
+    fn from_sql(sql: &'a str) -> Result<Self> {
+        Ok(parse_create_table_schema(sql)
+            .finish()
+            .map_err(|e| anyhow!("Unknown table schema: {} ({})", sql, e))?
+            .1)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnDef<'a> {
+    name: &'a str,
+    typ: Option<&'a str>,
+    constraints: (),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Schema {
     typ: TableType,
     name: Rc<str>,
     table_name: Rc<str>,
@@ -115,7 +257,7 @@ struct CreateTable {
     sql: Rc<str>,
 }
 
-impl CreateTable {
+impl Schema {
     fn from_record(record: &Record) -> Result<Self> {
         ensure!(
             record.values.len() == 5,
@@ -139,7 +281,7 @@ impl CreateTable {
         };
 
         let root_page = match &record.values[3] {
-            Value::Int(root_page) => usize::try_from(*root_page)? - 1,
+            Value::Int(root_page) => usize::try_from(*root_page)?.saturating_sub(1),
             otherwise => bail!("Invalid root page: {:?}", otherwise),
         };
 
@@ -539,6 +681,18 @@ impl Value {
         let value = i64::from_be_bytes(data);
 
         Ok((value, bytes))
+    }
+}
+
+impl Display for Value {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Value::Null => write!(f, "NULL"),
+            Value::Int(v) => write!(f, "{}", v),
+            Value::Float(v) => write!(f, "{}", v),
+            Value::Text(v) => write!(f, "{}", v),
+            Value::Blob(v) => write!(f, "{:?}", v),
+        }
     }
 }
 
