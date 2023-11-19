@@ -62,7 +62,45 @@ fn main() -> Result<()> {
                 }
             }
         }
-        _ => bail!("Missing or invalid command passed: {}", command),
+        query => {
+            let table = (|| {
+                let mut query = query.split_whitespace();
+                let _select = query.next().filter(|s| s.eq_ignore_ascii_case("SELECT"))?;
+                let _count = query
+                    .next()
+                    .filter(|s| s.eq_ignore_ascii_case("COUNT(*)"))?;
+                let _from = query.next().filter(|s| s.eq_ignore_ascii_case("FROM"))?;
+
+                query.next()
+            })()
+            .ok_or_else(|| anyhow!("Invalid query: {}", query))?;
+
+            let file = File::open(&args[1])?;
+
+            let mut db = Sqlite::new(file)?;
+            let root_page = db.page(0)?;
+
+            let table_def = root_page
+                .cells
+                .iter()
+                .find_map(|cell| match cell {
+                    Cell::LeafTable(cell) => {
+                        let create_table = match CreateTable::from_record(&cell.payload) {
+                            Ok(create_table) => create_table,
+                            Err(_) => return None,
+                        };
+                        if &*create_table.table_name == table {
+                            Some(create_table)
+                        } else {
+                            None
+                        }
+                    }
+                })
+                .ok_or_else(|| anyhow!("Table not found: {}", table))?;
+
+            let page = db.page(table_def.root_page)?;
+            println!("{}", page.cells.len());
+        }
     }
 
     Ok(())
