@@ -1,16 +1,18 @@
 use anyhow::{anyhow, bail, ensure, Result};
+use itertools::process_results;
 use nom::{
     branch::alt,
-    bytes::complete::{tag, tag_no_case, take_until1, take_while1},
-    character::complete::{multispace0, multispace1},
-    combinator::{all_consuming, map, opt, value},
+    bytes::complete::{escaped_transform, tag, tag_no_case, take_until1, take_while1},
+    character::complete::{digit1, multispace0, multispace1, none_of, one_of},
+    combinator::{all_consuming, cut, map, map_res, opt, value},
     multi::separated_list1,
+    number::complete::double,
     sequence::{delimited, pair, preceded, terminated, tuple},
     Finish, IResult,
 };
 use std::{
     borrow::Cow,
-    cmp::Reverse,
+    cmp::{Ordering, Reverse},
     ffi::CStr,
     fmt::Display,
     fs::File,
@@ -18,6 +20,20 @@ use std::{
     mem::size_of,
     rc::Rc,
 };
+
+#[cfg(not(debug_assertions))]
+macro_rules! ddbg {
+    ($e:expr) => {
+        $e
+    };
+}
+
+#[cfg(debug_assertions)]
+macro_rules! ddbg {
+    ($e:expr) => {
+        dbg!($e)
+    };
+}
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -28,16 +44,14 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    let file = File::open(&args[1])?;
+    let mut db = Sqlite::new(file)?;
+
     // Parse command and act accordingly
     let command = args[2].as_str();
     match command {
         ".dbinfo" => {
-            let file = File::open(&args[1])?;
-
-            let mut db = Sqlite::new(file)?;
             let page_size = db.header.page_size;
-
-            println!("database page size: {}", page_size);
 
             let mut num_tables = 0;
             let root_page = db.page(0)?;
@@ -50,12 +64,10 @@ fn main() -> Result<()> {
                 }
             }
 
+            println!("database page size: {}", page_size);
             println!("number of tables: {}", num_tables);
         }
         ".tables" => {
-            let file = File::open(&args[1])?;
-
-            let mut db = Sqlite::new(file)?;
             let root_page = db.page(0)?;
 
             for cell in root_page.cells.iter() {
@@ -68,14 +80,8 @@ fn main() -> Result<()> {
             }
         }
         query => {
-            let plan = parse_query(query)
-                .finish()
-                .map_err(|e| anyhow!("Invalid query: {}", e))?
-                .1;
-
-            let file = File::open(&args[1])?;
-            let mut db = Sqlite::new(file)?;
-
+            let plan = ddbg!(parse_query(query))?;
+            let plan = ddbg!(plan.translate(&mut db))?;
             plan.execute(&mut db)?;
         }
     };
@@ -83,23 +89,44 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug)]
-enum Plan<'a> {
-    CountRows {
-        table: &'a str,
-    },
-    SelectColumns {
-        table: &'a str,
-        columns: Vec<&'a str>,
-    },
+#[derive(Debug, Clone, PartialEq)]
+struct Plan<'a> {
+    op: LogicalOp<'a>,
+    table: &'a str,
+    filter: Option<Filter<'a>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LogicalOp<'a> {
+    Count,
+    SelectAll,
+    Select(Vec<&'a str>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PhysicalPlan {
+    root_page: usize,
+    op: PhysicalOp,
+    filter: Option<PhysicalFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum PhysicalOp {
+    Count,
+    SelectAll,
+    Select(Vec<usize>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PhysicalFilter {
+    column: usize,
+    op: Op,
+    value: Val,
 }
 
 impl Plan<'_> {
-    fn execute(&self, db: &mut Sqlite) -> Result<()> {
-        let from_table = match self {
-            Plan::CountRows { table } => *table,
-            Plan::SelectColumns { table, .. } => *table,
-        };
+    fn translate(self, db: &mut Sqlite) -> Result<PhysicalPlan> {
+        let from_table = self.table;
 
         let schema = db
             .page(0)?
@@ -120,17 +147,15 @@ impl Plan<'_> {
             })
             .ok_or_else(|| anyhow!("Table not found: {}", from_table))?;
 
-        match self {
-            Self::CountRows { .. } => {
-                let page = db.page(schema.root_page)?;
-                println!("{}", page.cells.len());
-            }
-            Self::SelectColumns { columns, .. } => {
-                let table_def = TableDef::from_sql(&schema.sql)?;
+        let table_def = TableDef::from_sql(&schema.sql)?;
 
+        let op = match self.op {
+            LogicalOp::Count => PhysicalOp::Count,
+            LogicalOp::SelectAll => PhysicalOp::SelectAll,
+            LogicalOp::Select(columns) => {
                 let columns = columns
-                    .iter()
-                    .map(|&col| {
+                    .into_iter()
+                    .map(|col| {
                         table_def
                             .columns
                             .iter()
@@ -139,19 +164,105 @@ impl Plan<'_> {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let page = db.page(schema.root_page)?;
-                page.cells.iter().for_each(|cell| {
-                    let Cell::LeafTable(cell) = cell;
+                if columns.is_empty() {
+                    bail!("No columns selected");
+                }
 
-                    let (last, init) = columns.split_last().unwrap();
+                if columns.iter().copied().eq(0..table_def.columns.len()) {
+                    PhysicalOp::SelectAll
+                } else {
+                    PhysicalOp::Select(columns)
+                }
+            }
+        };
 
-                    for &idx in init {
-                        print!("{}|", cell.payload.values[idx]);
-                    }
-                    print!("{}", cell.payload.values[*last]);
+        let filter = self
+            .filter
+            .map(|o| -> Result<PhysicalFilter> {
+                let column = table_def
+                    .columns
+                    .iter()
+                    .position(|c| c.name == o.column)
+                    .ok_or_else(|| anyhow!("Column not found: {}", o.column))?;
 
-                    println!();
-                });
+                Ok(PhysicalFilter {
+                    column,
+                    op: o.op,
+                    value: o.value,
+                })
+            })
+            .transpose()?;
+
+        Ok(PhysicalPlan {
+            root_page: schema.root_page,
+            op,
+            filter,
+        })
+    }
+}
+
+impl PhysicalPlan {
+    fn execute(&self, db: &mut Sqlite) -> Result<()> {
+        let page = db.page(self.root_page)?;
+
+        let rows = page
+            .cells
+            .iter()
+            .map(|cell| {
+                let Cell::LeafTable(cell) = cell;
+                cell
+            })
+            .filter_map(|cell| match self.filter.as_ref() {
+                None => Some(Ok(cell)),
+                Some(filter) => {
+                    let lhs = &filter.value;
+                    let rhs = &cell.payload.values[filter.column];
+                    let cmp = match compare(lhs, rhs) {
+                        Some(cmp) => cmp,
+                        None => {
+                            return Some(Err(anyhow!("Cannot compare {:?} and {:?}", lhs, rhs)))
+                        }
+                    };
+                    let filter = match filter.op {
+                        Op::Eq => cmp == Ordering::Equal,
+                        Op::Ne => cmp != Ordering::Equal,
+                        Op::Lt => cmp == Ordering::Less,
+                        Op::Le => cmp != Ordering::Greater,
+                        Op::Gt => cmp == Ordering::Greater,
+                        Op::Ge => cmp != Ordering::Less,
+                    };
+                    filter.then_some(Ok(cell))
+                }
+            });
+
+        match self.op {
+            PhysicalOp::Count => {
+                let count = process_results(rows, |i| i.count())?;
+                println!("{}", count);
+            }
+            PhysicalOp::SelectAll => {
+                process_results(rows, |i| {
+                    i.for_each(move |row| {
+                        let (last, init) = row.payload.values.split_last().unwrap();
+                        for val in init {
+                            print!("{}|", val);
+                        }
+                        print!("{}", last);
+                        println!();
+                    })
+                })?;
+            }
+            PhysicalOp::Select(ref columns) => {
+                let (&last, init) = columns.split_last().unwrap();
+                process_results(rows, |i| {
+                    i.for_each(move |row| {
+                        for &idx in init {
+                            print!("{}|", row.payload.values[idx]);
+                        }
+                        print!("{}", row.payload.values[last]);
+                        println!();
+                    })
+                })?;
             }
         }
 
@@ -159,30 +270,48 @@ impl Plan<'_> {
     }
 }
 
-fn parse_query(query: &str) -> IResult<&str, Plan<'_>> {
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    enum Op<'a> {
-        Count,
-        Select(Vec<&'a str>),
+fn compare(lhs: &Val, rhs: &Value) -> Option<Ordering> {
+    match (lhs, rhs) {
+        (Val::Null, Value::Null) => Some(Ordering::Equal),
+        (Val::Bool(false), Value::Int(0)) => Some(Ordering::Equal),
+        (Val::Bool(true), Value::Int(1)) => Some(Ordering::Equal),
+        (Val::Int(lhs), Value::Int(rhs)) => Some(lhs.cmp(rhs)),
+        (Val::Float(lhs), Value::Float(rhs)) => lhs.partial_cmp(rhs),
+        (Val::Text(lhs), Value::Text(rhs)) => Some(lhs.as_str().cmp(rhs)),
+        (Val::Text(lhs), Value::Blob(rhs)) => {
+            std::str::from_utf8(rhs).ok().map(|r| lhs.as_str().cmp(r))
+        }
+        _ => None,
     }
+}
 
+fn parse_query(q: &str) -> Result<Plan<'_>> {
+    Ok(query(q)
+        .finish()
+        .map_err(|e| anyhow!("Invalid query: {}", e))?
+        .1)
+}
+
+fn query(query: &str) -> IResult<&str, Plan<'_>> {
     all_consuming(map(
         tuple((
             terminated(tag_no_case("SELECT"), multispace1),
             alt((
-                value(Op::Count, tag_no_case("COUNT(*)")),
+                value(LogicalOp::Count, tag_no_case("COUNT(*)")),
+                value(LogicalOp::SelectAll, tag("*")),
                 map(
                     separated_list1(delimited(multispace0, tag(","), multispace0), name),
-                    Op::Select,
+                    LogicalOp::Select,
                 ),
             )),
             delimited(multispace1, tag_no_case("FROM"), multispace1),
             name,
+            opt(preceded(
+                delimited(multispace1, tag_no_case("WHERE"), multispace1),
+                filter,
+            )),
         )),
-        |(_, op, _, table)| match op {
-            Op::Count => Plan::CountRows { table },
-            Op::Select(columns) => Plan::SelectColumns { table, columns },
-        },
+        |(_, op, _, table, filter)| Plan { table, op, filter },
     ))(query)
 }
 
@@ -224,6 +353,85 @@ fn column_def(s: &str) -> IResult<&str, ColumnDef<'_>> {
             constraints,
         },
     )(s)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct Filter<'a> {
+    op: Op,
+    column: &'a str,
+    value: Val,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Val {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Text(String),
+}
+
+fn filter(s: &str) -> IResult<&str, Filter<'_>> {
+    map(
+        tuple((name, delimited(multispace0, op, multispace0), expr)),
+        |(column, op, value)| Filter { op, column, value },
+    )(s)
+}
+
+fn op(s: &str) -> IResult<&str, Op> {
+    alt((
+        value(Op::Eq, tuple((tag("="), opt(tag("="))))),
+        value(Op::Ne, alt((tag("!="), tag("<>")))),
+        value(Op::Le, tag("<=")),
+        value(Op::Lt, tag("<")),
+        value(Op::Ge, tag(">=")),
+        value(Op::Gt, tag(">")),
+    ))(s)
+}
+
+fn expr(s: &str) -> IResult<&str, Val> {
+    alt((
+        value(Val::Null, tag_no_case("NULL")),
+        value(Val::Bool(true), tag_no_case("TRUE")),
+        value(Val::Bool(false), tag_no_case("FALSE")),
+        // alt((
+        map_res(digit1, |s: &str| s.parse().map(Val::Int)),
+        // preceded(tag_no_case("0x"), map(hex_u32, |o| Value::Int(o.into()))),
+        // )),
+        map(double, Val::Float),
+        alt((
+            preceded(
+                tag("\""),
+                cut(terminated(
+                    map(
+                        escaped_transform(none_of(r#"\""#), '\\', one_of(r#""n\"#)),
+                        Val::Text,
+                    ),
+                    tag("\""),
+                )),
+            ),
+            preceded(
+                tag("'"),
+                cut(terminated(
+                    map(
+                        escaped_transform(none_of(r#"\'"#), '\\', one_of(r#"'n\"#)),
+                        Val::Text,
+                    ),
+                    tag("'"),
+                )),
+            ),
+        )),
+    ))(s)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
