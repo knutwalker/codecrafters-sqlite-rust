@@ -1,10 +1,10 @@
 use anyhow::{anyhow, bail, ensure, Result};
-use itertools::process_results;
+use itertools::Itertools;
 use nom::{
     branch::alt,
     bytes::complete::{escaped_transform, tag, tag_no_case, take_until1, take_while1},
-    character::complete::{digit1, multispace0, multispace1, none_of, one_of},
-    combinator::{all_consuming, cut, map, map_res, opt, value},
+    character::complete::{i64, multispace0, multispace1, none_of, one_of},
+    combinator::{all_consuming, cut, map, opt, value},
     multi::separated_list1,
     number::complete::double,
     sequence::{delimited, pair, preceded, terminated, tuple},
@@ -13,6 +13,7 @@ use nom::{
 use std::{
     borrow::Cow,
     cmp::{Ordering, Reverse},
+    collections::VecDeque,
     ffi::CStr,
     fmt::Display,
     fs::File,
@@ -58,6 +59,7 @@ fn main() -> Result<()> {
             for cell in root_page.cells.iter() {
                 let create_table = match cell {
                     Cell::LeafTable(cell) => Schema::from_record(&cell.payload)?,
+                    otherwise => bail!("Invalid root page cell: {:?}", otherwise),
                 };
                 if matches!(create_table.typ, TableType::Table) {
                     num_tables += 1;
@@ -73,6 +75,7 @@ fn main() -> Result<()> {
             for cell in root_page.cells.iter() {
                 let create_table = match cell {
                     Cell::LeafTable(cell) => Schema::from_record(&cell.payload)?,
+                    otherwise => bail!("Invalid root page cell: {:?}", otherwise),
                 };
                 if matches!(create_table.typ, TableType::Table) {
                     print!("{} ", create_table.table_name);
@@ -132,20 +135,13 @@ impl Plan<'_> {
             .page(0)?
             .cells
             .iter()
-            .find_map(|cell| match cell {
-                Cell::LeafTable(cell) => {
-                    let create_table = match Schema::from_record(&cell.payload) {
-                        Ok(create_table) => create_table,
-                        Err(_) => return None,
-                    };
-                    if &*create_table.table_name == from_table {
-                        Some(create_table)
-                    } else {
-                        None
-                    }
-                }
+            .map(|cell| match cell {
+                Cell::LeafTable(cell) => Schema::from_record(&cell.payload),
+                otherwise => bail!("Invalid root page cell: {:?}", otherwise),
             })
-            .ok_or_else(|| anyhow!("Table not found: {}", from_table))?;
+            .filter_ok(|create_table| &*create_table.table_name == from_table)
+            .next()
+            .ok_or_else(|| anyhow!("Table not found: {}", from_table))??;
 
         let table_def = TableDef::from_sql(&schema.sql)?;
 
@@ -203,69 +199,120 @@ impl Plan<'_> {
 
 impl PhysicalPlan {
     fn execute(&self, db: &mut Sqlite) -> Result<()> {
-        let page = db.page(self.root_page)?;
-
-        let rows = page
-            .cells
-            .iter()
-            .map(|cell| {
-                let Cell::LeafTable(cell) = cell;
-                cell
-            })
-            .filter_map(|cell| match self.filter.as_ref() {
-                None => Some(Ok(cell)),
-                Some(filter) => {
-                    let lhs = &filter.value;
-                    let rhs = &cell.payload.values[filter.column];
-                    let cmp = match compare(lhs, rhs) {
-                        Some(cmp) => cmp,
-                        None => {
-                            return Some(Err(anyhow!("Cannot compare {:?} and {:?}", lhs, rhs)))
-                        }
-                    };
-                    let filter = match filter.op {
-                        Op::Eq => cmp == Ordering::Equal,
-                        Op::Ne => cmp != Ordering::Equal,
-                        Op::Lt => cmp == Ordering::Less,
-                        Op::Le => cmp != Ordering::Greater,
-                        Op::Gt => cmp == Ordering::Greater,
-                        Op::Ge => cmp != Ordering::Less,
-                    };
-                    filter.then_some(Ok(cell))
-                }
-            });
-
         match self.op {
-            PhysicalOp::Count => {
-                let count = process_results(rows, |i| i.count())?;
-                println!("{}", count);
-            }
-            PhysicalOp::SelectAll => {
-                process_results(rows, |i| {
-                    i.for_each(move |row| {
-                        let (last, init) = row.payload.values.split_last().unwrap();
-                        for val in init {
-                            print!("{}|", val);
-                        }
-                        print!("{}", last);
-                        println!();
-                    })
-                })?;
-            }
+            PhysicalOp::Count => self.execute_op(db, Count(0)),
+            PhysicalOp::SelectAll => self.execute_op(db, SelectAll),
             PhysicalOp::Select(ref columns) => {
                 let (&last, init) = columns.split_last().unwrap();
-                process_results(rows, |i| {
-                    i.for_each(move |row| {
-                        for &idx in init {
-                            print!("{}|", row.payload.values[idx]);
+                self.execute_op(db, Select(init, last))
+            }
+        }
+    }
+
+    fn execute_op(&self, db: &mut Sqlite, mut operator: impl Operator) -> Result<()> {
+        let mut stack = VecDeque::new();
+        stack.push_back(self.root_page);
+
+        while let Some(page) = stack.pop_front() {
+            let page = db.page(page)?;
+            for cell in &*page.cells {
+                match cell {
+                    Cell::LeafTable(cell) => {
+                        if let Some(ref filter) = self.filter {
+                            let lhs = &filter.value;
+                            let rhs = &cell.payload.values[filter.column];
+                            let cmp = match compare(lhs, rhs) {
+                                Some(cmp) => cmp,
+                                None => {
+                                    return Err(anyhow!("Cannot compare {:?} and {:?}", lhs, rhs))
+                                }
+                            };
+                            let filter = match filter.op {
+                                Op::Eq => cmp == Ordering::Equal,
+                                Op::Ne => cmp != Ordering::Equal,
+                                Op::Lt => cmp == Ordering::Less,
+                                Op::Le => cmp != Ordering::Greater,
+                                Op::Gt => cmp == Ordering::Greater,
+                                Op::Ge => cmp != Ordering::Less,
+                            };
+                            if !filter {
+                                continue;
+                            }
                         }
-                        print!("{}", row.payload.values[last]);
-                        println!();
-                    })
-                })?;
+                        operator.execute(cell)?;
+                    }
+                    Cell::InteriorTable(cell) => {
+                        stack.push_back(cell.left_ptr as usize);
+                    }
+                }
             }
         }
 
+        operator.finish()
+    }
+}
+
+trait Operator {
+    fn execute(&mut self, cell: &LeafTableCell) -> Result<()>;
+
+    fn finish(self) -> Result<()>;
+}
+
+impl<T: Operator> Operator for &mut T {
+    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
+        (**self).execute(cell)
+    }
+
+    fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct Count(usize);
+
+impl Operator for Count {
+    fn execute(&mut self, _cell: &LeafTableCell) -> Result<()> {
+        self.0 += 1;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        println!("{}", self.0);
+        Ok(())
+    }
+}
+
+struct SelectAll;
+
+impl Operator for SelectAll {
+    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
+        let (last, init) = cell.payload.values.split_last().unwrap();
+        for val in init {
+            print!("{}|", val);
+        }
+        print!("{}", last);
+        println!();
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct Select<'a>(&'a [usize], usize);
+
+impl<'a> Operator for Select<'a> {
+    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
+        for &idx in self.0 {
+            print!("{}|", cell.payload.values[idx]);
+        }
+        print!("{}", cell.payload.values[self.1]);
+        println!();
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
         Ok(())
     }
 }
@@ -273,6 +320,8 @@ impl PhysicalPlan {
 fn compare(lhs: &Val, rhs: &Value) -> Option<Ordering> {
     match (lhs, rhs) {
         (Val::Null, Value::Null) => Some(Ordering::Equal),
+        (Val::Null, _) => Some(Ordering::Less),
+        (_, Value::Null) => Some(Ordering::Greater),
         (Val::Bool(false), Value::Int(0)) => Some(Ordering::Equal),
         (Val::Bool(true), Value::Int(1)) => Some(Ordering::Equal),
         (Val::Int(lhs), Value::Int(rhs)) => Some(lhs.cmp(rhs)),
@@ -325,7 +374,7 @@ fn parse_create_table_schema(sql: &str) -> IResult<&str, TableDef<'_>> {
                     terminated(tag_no_case("TABLE"), multispace1),
                 ),
             ),
-            name,
+            alt((delimited(tag("\""), name, tag("\"")), name)),
             delimited(
                 delimited(multispace0, tag("("), multispace0),
                 separated_list1(delimited(multispace0, tag(","), multispace0), column_def),
@@ -404,10 +453,7 @@ fn expr(s: &str) -> IResult<&str, Val> {
         value(Val::Null, tag_no_case("NULL")),
         value(Val::Bool(true), tag_no_case("TRUE")),
         value(Val::Bool(false), tag_no_case("FALSE")),
-        // alt((
-        map_res(digit1, |s: &str| s.parse().map(Val::Int)),
-        // preceded(tag_no_case("0x"), map(hex_u32, |o| Value::Int(o.into()))),
-        // )),
+        map(i64, Val::Int),
         map(double, Val::Float),
         alt((
             preceded(
@@ -592,6 +638,7 @@ impl LazyPage {
         match self {
             LazyPage::Loaded(page) => Ok(page),
             LazyPage::Unloaded => {
+                ddbg!(page_number);
                 let page_size = db_header.page_size;
                 let file_offset = page_number * page_size;
                 file.seek(SeekFrom::Start(u64::try_from(file_offset)?))?;
@@ -622,6 +669,7 @@ impl LazyPage {
 
 #[derive(Clone, Debug, PartialEq)]
 struct Page {
+    page_type: PageType,
     cells: Box<[Cell]>,
 }
 
@@ -634,7 +682,7 @@ impl Page {
         );
 
         let content = &page[header_start..];
-        let (header, mut content) = content.split_at(size_of::<PageHeaderStruct>());
+        let (header, content) = content.split_at(size_of::<PageHeaderStruct>());
         let header: &[u8; size_of::<PageHeaderStruct>()] = header.try_into()?;
         let header = unsafe { std::mem::transmute_copy::<_, PageHeaderStruct>(header) };
 
@@ -646,11 +694,19 @@ impl Page {
             otherwise => bail!("Invalid page type: {}", otherwise),
         };
 
-        if matches!(page_type, PageType::InteriorIndex | PageType::InteriorTable) {
-            content = content
-                .get(4..)
-                .ok_or_else(|| anyhow!("Page of length {} is not big enough", page.len()))?;
-        }
+        let (right_ptr, content) = match page_type {
+            PageType::InteriorIndex | PageType::InteriorTable => {
+                ensure!(
+                    content.len() >= 4,
+                    "Page of length {} is not big enough",
+                    page.len()
+                );
+                let (right_ptr, content) = content.split_at(4);
+                let right_ptr = u32::from_be_bytes(right_ptr.try_into()?);
+                (right_ptr, content)
+            }
+            _ => (u32::MAX, content),
+        };
 
         let number_of_cells = usize::from(u16::from_be_bytes(header.number_of_cells));
         let content_start = usize::from(u16::from_be_bytes(header.cell_content_area_offset));
@@ -661,33 +717,56 @@ impl Page {
             page.len(),
         );
 
-        let mut cell_positions = content[..number_of_cells * 2]
-            .chunks_exact(2)
-            .map(|v| u16::from_be_bytes([v[0], v[1]]))
-            .map(usize::from)
-            .collect::<Vec<_>>();
+        let cells = match page_type {
+            PageType::InteriorIndex | PageType::InteriorTable => {
+                let mut cells = content[..number_of_cells * 2]
+                    .chunks_exact(2)
+                    .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                    .map(usize::from)
+                    .map(|pos| &page[pos..])
+                    .map(|cell| Cell::from_bytes(text_encoding, page_type, cell))
+                    .collect::<Result<Vec<_>>>()?;
 
-        cell_positions.sort_unstable_by_key(|o| Reverse(*o));
+                cells.push(Cell::InteriorTable(InteriorTableCell::from_values(
+                    right_ptr,
+                    u64::MAX,
+                )?));
 
-        let mut cells = Vec::with_capacity(number_of_cells);
+                cells
+            }
+            PageType::LeafIndex | PageType::LeafTable => {
+                let mut cell_positions = content[..number_of_cells * 2]
+                    .chunks_exact(2)
+                    .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                    .map(usize::from)
+                    .collect::<Vec<_>>();
 
-        let mut page = page;
-        for pos in cell_positions {
-            ensure!(
-                pos >= content_start,
-                "Cell offset {} cannot be before content start ({})",
-                pos,
-                content_start
-            );
+                cell_positions.sort_unstable_by_key(|o| Reverse(*o));
 
-            let (rest, cell) = page.split_at(pos);
-            page = rest;
+                let mut cells = Vec::with_capacity(number_of_cells);
 
-            let cell = Cell::from_bytes(text_encoding, page_type, cell)?;
-            cells.push(cell);
-        }
+                let mut page = page;
+                for pos in cell_positions {
+                    ensure!(
+                        pos >= content_start,
+                        "Cell offset {} cannot be before content start ({})",
+                        pos,
+                        content_start
+                    );
+
+                    let (rest, cell) = page.split_at(pos);
+                    page = rest;
+
+                    let cell = Cell::from_bytes(text_encoding, page_type, cell)?;
+                    cells.push(cell);
+                }
+
+                cells
+            }
+        };
 
         Ok(Self {
+            page_type,
             cells: cells.into_boxed_slice(),
         })
     }
@@ -695,6 +774,7 @@ impl Page {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Cell {
+    InteriorTable(InteriorTableCell),
     LeafTable(LeafTableCell),
 }
 
@@ -702,7 +782,9 @@ impl Cell {
     fn from_bytes(text_encoding: TextEncoding, typ: PageType, bytes: &[u8]) -> Result<Self> {
         match typ {
             PageType::InteriorIndex => todo!(),
-            PageType::InteriorTable => todo!(),
+            PageType::InteriorTable => {
+                Ok(Self::InteriorTable(InteriorTableCell::from_bytes(bytes)?))
+            }
             PageType::LeafIndex => todo!(),
             PageType::LeafTable => Ok(Self::LeafTable(LeafTableCell::from_bytes(
                 text_encoding,
@@ -746,13 +828,47 @@ impl LeafTableCell {
             bytes = payload;
         }
 
-        let payload = Record::from_bytes(text_encoding, bytes)?;
+        let payload = Record::from_bytes(text_encoding, row_id, bytes)?;
 
         Ok(Self {
             row_id,
             payload,
             overflow,
         })
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+struct InteriorTableCell {
+    left_ptr: u32,
+    row_id: u64,
+}
+
+impl InteriorTableCell {
+    fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() >= 4,
+            "Not enough bytes to read a cell: expected at least 4 but only {} were available",
+            bytes.len()
+        );
+
+        let (left_ptr, bytes) = bytes.split_at(4);
+        let left_ptr = u32::from_be_bytes(left_ptr.try_into()?);
+
+        let (row_id, _, _) = read_varint(bytes)?;
+
+        Self::from_values(left_ptr, row_id)
+    }
+
+    fn from_values(left_ptr: u32, row_id: u64) -> Result<Self> {
+        let left_ptr = left_ptr.checked_sub(1).ok_or_else(|| {
+            anyhow!(
+                "Invalid left pointer: {} (must be at least 1, but 0 is reserved)",
+                left_ptr
+            )
+        })?;
+
+        Ok(Self { left_ptr, row_id })
     }
 }
 
@@ -797,7 +913,7 @@ struct Record {
 }
 
 impl Record {
-    fn from_bytes(text_encoding: TextEncoding, bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(text_encoding: TextEncoding, row_id: u64, bytes: &[u8]) -> Result<Self> {
         let (header_size, bytes, header_size_length) = read_varint(bytes)?;
         let (mut header, mut bytes) =
             bytes.split_at(usize::try_from(header_size)? - header_size_length);
@@ -807,8 +923,14 @@ impl Record {
         while !header.is_empty() {
             let (serial_type, rest, _) = read_varint(header)?;
             header = rest;
-            let (value, rest) = Value::from_bytes(text_encoding, serial_type, bytes)?;
+            let (mut value, rest) = Value::from_bytes(text_encoding, serial_type, bytes)?;
             bytes = rest;
+
+            if let Value::Null = value {
+                if values.is_empty() {
+                    value = Value::Int(row_id as i64);
+                }
+            }
 
             values.push(value);
         }
