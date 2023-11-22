@@ -6,12 +6,9 @@ use self::{
     query_parser::parse_query,
 };
 
-use anyhow::{bail, ensure, Result};
-use itertools::{process_results, Itertools as _};
-use std::{
-    fs::File,
-    io::{Read as _, Seek as _, SeekFrom},
-};
+use anyhow::{bail, Result};
+use memmap2::{Mmap, MmapOptions};
+use std::fs::File;
 
 mod btree;
 mod header;
@@ -43,39 +40,32 @@ fn main() -> Result<()> {
             let page_size = db.header.page_size;
             println!("database page size: {}", page_size);
 
-            let Page::LeafTable(root_page) = db.page(0)? else {
+            let Page::LeafTable(root_page) = db.page(0) else {
                 bail!("Root page is not a leaf table page");
             };
 
-            let num_tables = process_results(
-                root_page
-                    .iter()
-                    .map(|cell| Schema::from_record(&cell.payload))
-                    .filter_ok(|ct| ct.typ() == TableType::Table),
-                |tables| tables.count(),
-            )?;
+            let num_tables = root_page
+                .iter()
+                .filter(|cell| Schema::from_record(cell.payload).typ() == TableType::Table)
+                .count();
 
             println!("number of tables: {}", num_tables);
         }
         ".tables" => {
-            let Page::LeafTable(root_page) = db.page(0)? else {
+            let Page::LeafTable(root_page) = db.page(0) else {
                 bail!("Root page is not a leaf table page");
             };
 
-            process_results(
-                root_page
-                    .iter()
-                    .map(|cell| Schema::from_record(&cell.payload))
-                    .filter_map_ok(|ct| {
-                        (ct.typ() == TableType::Table).then(|| ct.into_table_name())
-                    }),
-                |tables| tables.for_each(|table| println!("{}", table)),
-            )?;
+            root_page
+                .iter()
+                .map(|cell| Schema::from_record(cell.payload))
+                .filter(|schema| schema.typ() == TableType::Table)
+                .for_each(|schema| println!("{}", schema.table_name()));
         }
         query => {
             let plan = parse_query(query)?;
             let plan = plan.translate(&mut db)?;
-            plan.execute(&mut db)?;
+            plan.execute(&mut db);
         }
     };
 
@@ -83,38 +73,38 @@ fn main() -> Result<()> {
 }
 
 struct Sqlite {
-    file: File,
+    file: Mmap,
     header: DbHeader,
     pages: Box<[LazyPage]>,
 }
 
 impl Sqlite {
-    fn new(mut file: File) -> Result<Self> {
-        file.seek(SeekFrom::Start(0))?;
+    fn new(file: File) -> Result<Self> {
+        let map = unsafe { MmapOptions::new().populate().map(&file) }?;
+        map.advise(memmap2::Advice::Random)?;
 
-        let mut header = [0; 100];
-        file.read_exact(&mut header)?;
+        let header = DbHeader::from_bytes(&file, map[..100].try_into().unwrap())?;
 
-        let header = DbHeader::from_bytes(&file, header)?;
-
-        let pages = vec![LazyPage::default(); header.db_size].into_boxed_slice();
+        let mut pages = Vec::with_capacity(header.db_size);
+        pages.resize_with(header.db_size, LazyPage::default);
+        let pages = pages.into_boxed_slice();
 
         Ok(Self {
-            file,
+            file: map,
             header,
             pages,
         })
     }
 
-    fn page(&mut self, page_number: usize) -> Result<&Page> {
-        ensure!(
+    fn page(&mut self, page_number: usize) -> &Page {
+        assert!(
             page_number < self.header.db_size,
             "Invalid page number: {}, number of pages: {}",
             page_number,
             self.header.db_size
         );
 
-        self.pages[page_number].load(&mut self.file, &self.header, page_number)
+        self.pages[page_number].load(&self.file, &self.header, page_number)
     }
 }
 

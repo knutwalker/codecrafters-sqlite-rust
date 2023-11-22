@@ -1,20 +1,11 @@
-use std::ops::Deref;
+use crate::values::Value;
 
-use anyhow::{anyhow, Result};
-use nom::{bytes::complete::take_while_m_n, number::complete::u8, IResult};
-
-use crate::{header::TextEncoding, values::Value};
-
-fn read_varint(bytes: &[u8]) -> Result<(u64, &[u8], usize)> {
+pub fn read_varint(bytes: &[u8]) -> (u64, &[u8], usize) {
     let mut result = 0;
     let mut bytes_read = 0;
 
-    let mut bs = bytes.iter().copied();
-
     loop {
-        let byte = bs
-            .next()
-            .ok_or_else(|| anyhow!("Unexpected end of bytes"))?;
+        let byte = bytes[bytes_read];
         bytes_read += 1;
 
         if bytes_read == 9 {
@@ -29,85 +20,89 @@ fn read_varint(bytes: &[u8]) -> Result<(u64, &[u8], usize)> {
         }
     }
 
-    Ok((result, &bytes[bytes_read..], bytes_read))
+    (result, &bytes[bytes_read..], bytes_read)
 }
 
-fn _nom_varint(input: &[u8]) -> IResult<&[u8], u64> {
-    let (mut rest, prefix) = take_while_m_n(1, 9, |b| b & 0b1000_0000 == 0b1000_0000)(input)?;
-
-    let (last, prefix, last_shift) = if prefix.len() == 9 {
-        let (last, prefix) = prefix.split_last().unwrap();
-        (*last, prefix, 8)
-    } else {
-        let (new_rest, last) = u8(rest)?;
-        rest = new_rest;
-        (last, prefix, 7)
-    };
-
-    let prefix = prefix
-        .iter()
-        .fold(0_u64, |acc, b| (acc << 7) | u64::from(b & 0b0111_1111));
-
-    Ok((rest, (prefix << last_shift) | u64::from(last)))
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct LazyRecord {
+    bytes: *const u8,
+    header: usize,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Record {
-    values: Box<[Value]>,
-}
+impl LazyRecord {
+    pub fn new(bytes: &[u8]) -> Self {
+        let (header_size, payload, header_size_length) = read_varint(bytes);
 
-impl Record {
-    pub fn from_bytes(
-        text_encoding: TextEncoding,
-        row_id: Option<u64>,
-        bytes: &[u8],
-    ) -> Result<Self> {
-        let values = Self::values_from_bytes(text_encoding, row_id, bytes)?;
-        Ok(Self {
-            values: values.into_boxed_slice(),
-        })
+        let bytes = payload.as_ptr();
+        let header = header_size as usize - header_size_length;
+
+        Self { bytes, header }
     }
 
-    pub fn new(values: Vec<Value>) -> Self {
-        Self {
-            values: values.into_boxed_slice(),
-        }
-    }
+    pub fn value_at(&self, index: usize) -> Value {
+        let mut payload_offset = 0;
 
-    pub(crate) fn values_from_bytes(
-        text_encoding: TextEncoding,
-        row_id: Option<u64>,
-        bytes: &[u8],
-    ) -> Result<Vec<Value>> {
-        let (header_size, bytes, header_size_length) = read_varint(bytes)?;
-        let (mut header, mut bytes) =
-            bytes.split_at(usize::try_from(header_size)? - header_size_length);
-
-        let mut values = Vec::new();
-
-        while !header.is_empty() {
-            let (serial_type, rest, _) = read_varint(header)?;
+        let mut header = unsafe { std::slice::from_raw_parts(self.bytes, self.header) };
+        for _ in 0..index {
+            let (serial_type, rest, _) = read_varint(header);
+            payload_offset += Value::payload_size(serial_type);
             header = rest;
-            let (rest, mut value) = Value::from_bytes(text_encoding, serial_type, bytes)?;
-            bytes = rest;
-
-            if values.is_empty() {
-                if let (Value::Null, Some(row_id)) = (&value, row_id) {
-                    value = Value::Int(row_id as i64);
-                }
-            }
-
-            values.push(value);
         }
 
-        Ok(values)
+        let (serial_type, _, _) = read_varint(header);
+        let payload_size = Value::payload_size(serial_type);
+        let payload = unsafe { self.bytes.add(self.header + payload_offset) };
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_size) };
+        let (_, value) = Value::from_bytes(serial_type, payload);
+
+        value
+    }
+
+    pub fn values(&self) -> LazyRecordValues<'_> {
+        LazyRecordValues {
+            header: unsafe { std::slice::from_raw_parts(self.bytes, self.header) },
+            payload: unsafe { self.bytes.add(self.header) },
+        }
+    }
+
+    pub fn for_each(&self, mut op: impl FnMut(Value)) {
+        let mut payload = unsafe { self.bytes.add(self.header) };
+        let mut header = unsafe { std::slice::from_raw_parts(self.bytes, self.header) };
+        while !header.is_empty() {
+            let (serial_type, next_header, _) = read_varint(header);
+            let payload_size = Value::payload_size(serial_type);
+            let payload_data = unsafe { std::slice::from_raw_parts(payload, payload_size) };
+            let (_, value) = Value::from_bytes(serial_type, payload_data);
+
+            op(value);
+
+            header = next_header;
+            payload = unsafe { payload.add(payload_size) };
+        }
     }
 }
 
-impl Deref for Record {
-    type Target = [Value];
+pub struct LazyRecordValues<'a> {
+    header: &'a [u8],
+    payload: *const u8,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.values
+impl<'a> Iterator for LazyRecordValues<'a> {
+    type Item = Value;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.header.is_empty() {
+            return None;
+        }
+
+        let (serial_type, next_header, _) = read_varint(self.header);
+        let payload_size = Value::payload_size(serial_type);
+        let payload_data = unsafe { std::slice::from_raw_parts(self.payload, payload_size) };
+        let (_, value) = Value::from_bytes(serial_type, payload_data);
+
+        self.header = next_header;
+        self.payload = unsafe { self.payload.add(payload_size) };
+
+        Some(value)
     }
 }

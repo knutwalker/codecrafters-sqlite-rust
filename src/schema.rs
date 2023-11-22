@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, ensure, Result};
+use anyhow::{anyhow, bail, Result};
 use nom::{
     branch::alt,
     bytes::complete::{tag, tag_no_case, take_until1, take_while1},
@@ -8,85 +8,61 @@ use nom::{
     sequence::{delimited, pair, preceded, terminated, tuple},
     Finish, IResult,
 };
-use std::{ops::Deref, rc::Rc};
+use std::ops::Deref;
 
-use crate::values::Value;
+use crate::record::LazyRecord;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Schema {
-    typ: TableType,
-    name: Rc<str>,
-    table_name: Rc<str>,
-    root_page: usize,
-    sql: Rc<str>,
+    record: LazyRecord,
 }
 
 impl Schema {
-    pub fn from_record(record: &[Value]) -> Result<Self> {
-        ensure!(
-            record.len() == 5,
-            "Invalid number of values in a create table record: {}",
-            record.len()
-        );
-
-        let typ = match &record[0] {
-            Value::Text(typ) => TableType::from_text(typ)?,
-            otherwise => bail!("Invalid table type: {:?}", otherwise),
-        };
-
-        let name = match &record[1] {
-            Value::Text(name) => name.clone(),
-            otherwise => bail!("Invalid table name: {:?}", otherwise),
-        };
-
-        let table_name = match &record[2] {
-            Value::Text(table_name) => table_name.clone(),
-            otherwise => bail!("Invalid table name: {:?}", otherwise),
-        };
-
-        let root_page = match &record[3] {
-            Value::Int(root_page) => usize::try_from(*root_page)?.saturating_sub(1),
-            otherwise => bail!("Invalid root page: {:?}", otherwise),
-        };
-
-        let sql = match &record[4] {
-            Value::Text(sql) => sql.clone(),
-            otherwise => bail!("Invalid sql: {:?}", otherwise),
-        };
-
-        Ok(Self {
-            typ,
-            name,
-            table_name,
-            root_page,
-            sql,
-        })
-    }
-
     pub fn typ(&self) -> TableType {
-        self.typ
-    }
+        let Some(typ) = self.record.value_at(0).as_text() else {
+            unreachable!("type is always a text value")
+        };
 
-    pub fn into_table_name(self) -> Rc<str> {
-        self.table_name
+        match TableType::from_text(typ) {
+            Ok(typ) => typ,
+            Err(e) => panic!("Invalid table type: {}", e),
+        }
     }
 
     pub fn table_name(&self) -> &str {
-        self.table_name.as_ref()
-    }
+        let Some(table_name) = self.record.value_at(2).as_text() else {
+            unreachable!("table_name is always a text value")
+        };
 
-    pub fn root_page(&self) -> usize {
-        self.root_page
+        table_name
     }
 
     pub fn table_def(&self) -> Result<TableDef<'_>> {
-        assert!(self.typ == TableType::Table);
-        TableDef::from_sql(self.sql.as_ref())
+        let Some(sql) = self.record.value_at(4).as_text() else {
+            unreachable!("sql is always a text value")
+        };
+
+        TableDef::from_sql(sql)
     }
 
     pub fn index_def(&self) -> Result<IndexDef<'_>> {
-        assert!(self.typ == TableType::Index);
-        IndexDef::from_sql(self.sql.as_ref())
+        let Some(sql) = self.record.value_at(4).as_text() else {
+            unreachable!("sql is always a text value")
+        };
+
+        IndexDef::from_sql(sql)
+    }
+
+    pub fn root_page(&self) -> usize {
+        let Some(root_page) = self.record.value_at(3).as_int() else {
+            unreachable!("root_page is always an int value")
+        };
+
+        root_page as usize - 1
+    }
+
+    pub fn from_record(record: LazyRecord) -> Self {
+        Self { record }
     }
 }
 
@@ -147,7 +123,7 @@ impl<'a> IndexDef<'a> {
 pub struct ColumnDef<'a> {
     pub name: &'a str,
     typ: Option<&'a str>,
-    constraints: (),
+    pub primary_key: bool,
 }
 
 fn parse_create_table_schema(sql: &str) -> IResult<&str, TableDef<'_>> {
@@ -188,12 +164,13 @@ fn column_def(s: &str) -> IResult<&str, ColumnDef<'_>> {
         tuple((
             quoted_name,
             opt(preceded(multispace1, name)),
+            opt(value((), preceded(multispace1, tag_no_case("PRIMARY KEY")))),
             value((), opt(take_until1(","))),
         )),
-        |(name, typ, constraints)| ColumnDef {
+        |(name, typ, pk, _)| ColumnDef {
             name,
             typ,
-            constraints,
+            primary_key: pk.is_some(),
         },
     )(s)
 }

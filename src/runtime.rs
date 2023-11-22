@@ -1,6 +1,3 @@
-use anyhow::{bail, Result};
-use std::{collections::VecDeque, iter::once};
-
 use crate::{
     operators::{Count, Op, Operator, Select, SelectAll},
     page::Page,
@@ -12,195 +9,160 @@ use crate::{
 pub struct PhysicalPlan {
     root_page: usize,
     scan: Scan,
+    op: LeafOp,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scan {
     Index {
         root_page: usize,
-        column: usize,
         value: Val,
-        op: LeafOp,
     },
     Table {
         column: usize,
         value: Val,
         compare: Op,
-        op: LeafOp,
     },
-    FullTable {
-        op: LeafOp,
-    },
+    FullTable,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LeafOp {
     Count,
-    SelectAll,
-    Select { init: Vec<usize>, last: usize },
+    SelectAll { primary_key: usize },
+    Select { columns: Vec<(usize, bool)> },
 }
 
 impl PhysicalPlan {
-    pub fn new(root_page: usize, scan: Scan) -> Self {
-        Self { root_page, scan }
+    pub fn new(root_page: usize, scan: Scan, op: LeafOp) -> Self {
+        Self {
+            root_page,
+            scan,
+            op,
+        }
     }
 
-    pub fn execute(self, db: &mut Sqlite) -> Result<()> {
+    pub fn execute(self, db: &mut Sqlite) {
+        match &self.op {
+            LeafOp::Count => self.execute_op(db, Count::default()),
+            LeafOp::SelectAll { primary_key } => self.execute_op(db, SelectAll::new(*primary_key)),
+            LeafOp::Select { ref columns } => self.execute_op(db, Select::new(columns)),
+        }
+    }
+
+    fn execute_op(&self, db: &mut Sqlite, operator: impl Operator) {
         match self.scan {
             Scan::Index {
                 root_page,
-                column,
-                value,
-                op,
-            } => {
-                let row_ids = index_scan(db, root_page, column, value)?;
-                match op {
-                    LeafOp::Count => Count::new(row_ids.len()).finish(),
-                    LeafOp::SelectAll => seek_all(db, self.root_page, row_ids, SelectAll),
-                    LeafOp::Select { init, last } => {
-                        seek_all(db, self.root_page, row_ids, Select::new(init, last))
-                    }
-                }
-            }
+                ref value,
+            } => index_scan(db, self.root_page, root_page, value, operator),
             Scan::Table {
                 column,
-                value,
+                ref value,
                 compare,
-                op,
-            } => match op {
-                LeafOp::Count => table_scan_op(
-                    db,
-                    self.root_page,
-                    Count::default().filtered(column, value, compare),
-                ),
-                LeafOp::SelectAll => table_scan_op(
-                    db,
-                    self.root_page,
-                    SelectAll.filtered(column, value, compare),
-                ),
-                LeafOp::Select { init, last } => table_scan_op(
-                    db,
-                    self.root_page,
-                    Select::new(init, last).filtered(column, value, compare),
-                ),
-            },
-            Scan::FullTable { op } => match op {
-                LeafOp::Count => table_scan_op(db, self.root_page, Count::default()),
-                LeafOp::SelectAll => table_scan_op(db, self.root_page, SelectAll),
-                LeafOp::Select { init, last } => {
-                    table_scan_op(db, self.root_page, Select::new(init, last))
-                }
-            },
+            } => table_scan(
+                db,
+                self.root_page,
+                operator.filtered(column, value, compare),
+            ),
+            Scan::FullTable => table_scan(db, self.root_page, operator),
         }
     }
 }
 
 fn index_scan(
     db: &mut Sqlite,
+    table_root: usize,
     index_root: usize,
-    index_column: usize,
-    condition: Val,
-) -> Result<Vec<u64>> {
-    let mut row_ids = Vec::new();
-    let mut next_pages = VecDeque::new();
-    next_pages.push_back(index_root);
-
-    while let Some(page_id) = next_pages.pop_front() {
-        let page = db.page(page_id)?;
-
-        match page {
-            Page::LeafTable(_) | Page::InteriorTable(_) => bail!("Expected index page"),
-            Page::LeafIndex(page) => {
-                let lower = page.partition_point(|cell| cell.lower_bound(index_column, &condition));
-                let upper = page.partition_point(|cell| cell.upper_bound(index_column, &condition));
-
-                row_ids.extend(page[lower..upper].iter().map(|cell| cell.row_id));
-            }
-            Page::InteriorIndex(page) => {
-                let lower = page.partition_point(|cell| cell.lower_bound(index_column, &condition));
-                let upper = page.partition_point(|cell| cell.upper_bound(index_column, &condition));
-
-                row_ids.extend(page[lower..upper].iter().map(|cell| cell.row_id));
-
-                next_pages.extend(
-                    page[lower..upper]
-                        .iter()
-                        .map(|cell| cell.left_ptr)
-                        .chain(once(
-                            page.get(upper).map_or(page.right_ptr, |cell| cell.left_ptr),
-                        ))
-                        .map(|ptr| ptr as usize),
-                );
-            }
-        };
-    }
-
-    Ok(row_ids)
-}
-
-fn table_scan_op(db: &mut Sqlite, root_page: usize, mut operator: impl Operator) -> Result<()> {
-    let mut stack = VecDeque::new();
-    stack.push_back(root_page);
-
-    while let Some(page) = stack.pop_front() {
-        let page = db.page(page)?;
-
-        match page {
-            Page::LeafTable(page) => {
-                for cell in page.iter() {
-                    operator.execute(cell)?;
-                }
-            }
-            Page::InteriorTable(page) => {
-                stack.extend(page.iter().map(|cell| cell.left_ptr as usize));
-                stack.push_back(page.right_ptr as usize);
-            }
-            Page::LeafIndex(_) | Page::InteriorIndex(_) => bail!("Expected table page"),
-        };
-    }
-
-    operator.finish()
-}
-
-fn seek_all(
-    db: &mut Sqlite,
-    root_page: usize,
-    keys: impl IntoIterator<Item = u64> + std::fmt::Debug,
+    condition: &Val,
     mut operator: impl Operator,
-) -> Result<()> {
-    for key in keys {
-        seek_op(db, root_page, key, &mut operator)?;
-    }
+) {
+    page_index_scan(db, table_root, index_root, condition, &mut operator);
     operator.finish()
 }
 
-fn seek_op(
+fn page_index_scan(
     db: &mut Sqlite,
-    root_page: usize,
-    key: u64,
+    table_root: usize,
+    page_id: usize,
+    condition: &Val,
     operator: &mut impl Operator,
-) -> Result<()> {
+) {
+    let page = db.page(page_id);
+
+    match page {
+        Page::LeafTable(_) | Page::InteriorTable(_) => panic!("Expected index page"),
+        Page::LeafIndex(page) => {
+            let lower = page.partition_point(|cell| cell.lower_bound(condition));
+            let upper = page.partition_point(|cell| cell.upper_bound(condition));
+
+            for cell in page.slice(lower..upper) {
+                seek(db, table_root, cell.row_id, operator);
+            }
+        }
+        Page::InteriorIndex(page) => {
+            let lower = page.partition_point(|cell| cell.lower_bound(condition));
+            let upper = page.partition_point(|cell| cell.upper_bound(condition));
+
+            let right_ptr = page.get(upper).map_or(page.right_ptr, |cell| cell.left_ptr);
+
+            for page in page.slice(lower..upper) {
+                let row_id = page.row_id;
+                page_index_scan(db, table_root, page.left_ptr as usize, condition, operator);
+
+                seek(db, table_root, row_id, operator);
+            }
+
+            page_index_scan(db, table_root, right_ptr as usize, condition, operator);
+        }
+    };
+}
+
+fn table_scan(db: &mut Sqlite, root_page: usize, mut operator: impl Operator) {
+    page_scan(db, root_page, &mut operator);
+    operator.finish()
+}
+
+fn page_scan(db: &mut Sqlite, page: usize, operator: &mut impl Operator) {
+    let page = db.page(page);
+
+    match page {
+        Page::LeafTable(page) => {
+            for cell in page.iter() {
+                operator.execute(&cell);
+            }
+        }
+        Page::InteriorTable(page) => {
+            let last_page = page.right_ptr as usize;
+            for cell in page.iter() {
+                page_scan(db, cell.left_ptr as usize, operator);
+            }
+            page_scan(db, last_page, operator);
+        }
+        Page::LeafIndex(_) | Page::InteriorIndex(_) => panic!("Expected table page"),
+    };
+}
+
+fn seek(db: &mut Sqlite, root_page: usize, key: u64, operator: &mut impl Operator) {
     let mut next_page = Some(root_page);
 
     while let Some(page_id) = next_page.take() {
-        let page = db.page(page_id)?;
+        let page = db.page(page_id);
 
         match page {
-            Page::LeafIndex(_) | Page::InteriorIndex(_) => bail!("Expected table page"),
+            Page::LeafIndex(_) | Page::InteriorIndex(_) => panic!("Expected table page"),
             Page::LeafTable(page) => {
-                if let Ok(idx) = page.binary_search_by_key(&key, |cell| cell.row_id) {
-                    operator.execute(&page[idx])?;
+                if let Ok(idx) = page.binary_search(&key, |cell| cell.row_id) {
+                    operator.execute(&page.at(idx));
                 };
             }
             Page::InteriorTable(page) => {
-                let next_ptr = match page.binary_search_by_key(&key, |cell| cell.row_id) {
-                    Ok(idx) => page[idx].left_ptr,
+                let next_ptr = match page.binary_search(&key, |cell| cell.row_id) {
+                    Ok(idx) => page.at(idx).left_ptr,
                     Err(idx) => page.get(idx).map_or(page.right_ptr, |cell| cell.left_ptr),
                 };
                 next_page = Some(next_ptr as usize);
             }
         };
     }
-
-    Ok(())
 }

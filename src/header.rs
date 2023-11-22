@@ -1,50 +1,17 @@
 use anyhow::{anyhow, bail, ensure, Result};
-use std::{borrow::Cow, ffi::CStr, fs::File};
+use std::{ffi::CStr, fs::File};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DbHeader {
     pub page_size: usize,
     pub db_size: usize,
     pub reserved_size: usize,
-    pub text_encoding: TextEncoding,
-    pub sqlite_version: (u16, u16, u16),
 }
 
 impl DbHeader {
     pub fn from_bytes(file: &File, bytes: [u8; 100]) -> Result<Self> {
         let header = unsafe { std::mem::transmute::<_, DbHeaderStruct>(bytes) };
         header.verify(file)
-    }
-}
-
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum TextEncoding {
-    #[default]
-    Utf8 = 1,
-    Utf16le = 2,
-    Utf16be = 3,
-}
-
-impl TextEncoding {
-    // TODO: get rid, fail on utf16, inline utf8 and remove Rc/Cow
-    pub fn read(self, bytes: &[u8]) -> Result<Cow<str>> {
-        fn convert(bytes: &[u8], mapper: impl Fn([u8; 2]) -> u16) -> Result<String> {
-            if bytes.len() % 2 != 0 {
-                bail!("Invalid utf16 string length: {:?}", bytes.len());
-            }
-
-            Ok(
-                char::decode_utf16(bytes.chunks_exact(2).map(|v| mapper([v[0], v[1]])))
-                    .map(|r| r.unwrap_or(char::REPLACEMENT_CHARACTER))
-                    .collect::<String>(),
-            )
-        }
-
-        match self {
-            Self::Utf8 => Ok(std::str::from_utf8(bytes)?.into()),
-            Self::Utf16le => Ok(convert(bytes, u16::from_le_bytes)?.into()),
-            Self::Utf16be => Ok(convert(bytes, u16::from_be_bytes)?.into()),
-        }
     }
 }
 
@@ -156,35 +123,11 @@ impl DbHeaderStruct {
             ensure!(mode == 0, "Invalid incremental vacuum mode: {}", mode);
         }
 
-        let text_encoding = match u32::from_be_bytes(self.text_encoding) {
-            1 => TextEncoding::Utf8,
-            2 => TextEncoding::Utf16le,
-            3 => TextEncoding::Utf16be,
+        match u32::from_be_bytes(self.text_encoding) {
+            1 => {}
+            nope @ (2 | 3) => bail!("Unsupported text encoding {}, only utf8 is supported", nope),
             otherwise => bail!("Invalid text encoding: {}", otherwise),
         };
-
-        let version = u32::from_be_bytes(self.sqlite_version_number);
-
-        let patch = version % 1000;
-        let version = version / 1000;
-
-        let minor = version % 1000;
-        let version = version / 1000;
-
-        let major = version % 1000;
-        let version = version / 1000;
-
-        let (major, minor, patch) = (
-            u16::try_from(major)?,
-            u16::try_from(minor)?,
-            u16::try_from(patch)?,
-        );
-
-        ensure!(
-            version == 0,
-            "Invalid sqlite version: {}",
-            u32::from_be_bytes(self.sqlite_version_number)
-        );
 
         if self.unused.iter().any(|&b| b != 0) {
             bail!("Invalid unused space: {:?}", self.unused);
@@ -194,8 +137,6 @@ impl DbHeaderStruct {
             page_size: usize::try_from(page_size)?,
             db_size: usize::try_from(db_size)?,
             reserved_size: usize::from(self.reserved_space),
-            text_encoding,
-            sqlite_version: (major, minor, patch),
         })
     }
 }

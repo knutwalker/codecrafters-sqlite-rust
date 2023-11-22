@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Result};
 use std::cmp::Ordering;
 
 use crate::{btree::LeafTableCell, values::Val};
@@ -14,11 +13,15 @@ pub enum Op {
 }
 
 pub trait Operator {
-    fn execute(&mut self, cell: &LeafTableCell) -> Result<()>;
+    fn execute(&mut self, cell: &LeafTableCell);
 
-    fn finish(self) -> Result<()>;
+    fn finish(self)
+    where
+        Self: Sized,
+    {
+    }
 
-    fn filtered(self, column: usize, value: Val, compare: Op) -> FilterOp<Self>
+    fn filtered(self, column: usize, value: &Val, compare: Op) -> FilterOp<'_, Self>
     where
         Self: Sized,
     {
@@ -32,92 +35,99 @@ pub trait Operator {
 }
 
 impl<T: Operator> Operator for &mut T {
-    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
+    fn execute(&mut self, cell: &LeafTableCell) {
         (**self).execute(cell)
-    }
-
-    fn finish(self) -> Result<()> {
-        Ok(())
     }
 }
 
 #[derive(Debug, Default)]
 pub struct Count(usize);
 
-impl Count {
-    pub fn new(count: usize) -> Self {
-        Self(count)
-    }
-}
-
 impl Operator for Count {
-    fn execute(&mut self, _cell: &LeafTableCell) -> Result<()> {
+    fn execute(&mut self, _cell: &LeafTableCell) {
         self.0 += 1;
-        Ok(())
     }
 
-    fn finish(self) -> Result<()> {
+    fn finish(self) {
         println!("{}", self.0);
-        Ok(())
     }
 }
 
-#[derive(Debug, Default)]
-pub struct SelectAll;
+#[derive(Debug)]
+pub struct SelectAll {
+    primary_key: usize,
+}
+
+impl SelectAll {
+    pub fn new(primary_key: usize) -> Self {
+        Self { primary_key }
+    }
+}
 
 impl Operator for SelectAll {
-    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
-        let (last, init) = cell.payload.split_last().unwrap();
-        for val in init {
-            print!("{}|", val);
-        }
-        print!("{}", last);
+    fn execute(&mut self, cell: &LeafTableCell) {
+        let pk = self.primary_key;
+        let mut index = 0;
+        cell.payload.for_each(|val| {
+            if index > 0 {
+                print!("|");
+            }
+            if index == pk {
+                print!("{}", cell.row_id);
+            } else {
+                print!("{}", val);
+            }
+            index += 1;
+        });
+
         println!();
-        Ok(())
-    }
-
-    fn finish(self) -> Result<()> {
-        Ok(())
     }
 }
 
-pub struct Select(Vec<usize>, usize);
+pub struct Select<'a>(&'a [(usize, bool)], (usize, bool));
 
-impl Select {
-    pub fn new(initial_columns: Vec<usize>, last_column: usize) -> Self {
-        Self(initial_columns, last_column)
+impl<'a> Select<'a> {
+    pub fn new(columns: &'a [(usize, bool)]) -> Self {
+        let (&last, init) = columns.split_last().unwrap();
+        Self(init, last)
     }
 }
 
-impl Operator for Select {
-    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
-        for &idx in &self.0 {
-            print!("{}|", cell.payload[idx]);
+impl<'a> Operator for Select<'a> {
+    fn execute(&mut self, cell: &LeafTableCell) {
+        for &(idx, pk) in self.0 {
+            if pk {
+                print!("{}|", cell.row_id);
+            } else {
+                print!("{}|", cell.payload.value_at(idx));
+            }
         }
-        print!("{}", cell.payload[self.1]);
-        println!();
-        Ok(())
-    }
 
-    fn finish(self) -> Result<()> {
-        Ok(())
+        let &(idx, pk) = &self.1;
+        if pk {
+            print!("{}", cell.row_id);
+        } else {
+            print!("{}", cell.payload.value_at(idx));
+        }
+
+        println!();
     }
 }
 
-pub struct FilterOp<T> {
+pub struct FilterOp<'a, T> {
     column: usize,
-    value: Val,
+    value: &'a Val,
     compare: Op,
     op: T,
 }
 
-impl<T: Operator> Operator for FilterOp<T> {
-    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
-        let lhs = &self.value;
-        let rhs = &cell.payload[self.column];
-        let cmp = match lhs.partial_cmp(rhs) {
+impl<'a, T: Operator> Operator for FilterOp<'a, T> {
+    fn execute(&mut self, cell: &LeafTableCell) {
+        let lhs = self.value;
+        let rhs = cell.payload.value_at(self.column);
+        let cmp = match lhs.partial_cmp(&rhs) {
             Some(cmp) => cmp,
-            None => return Err(anyhow!("Cannot compare {:?} and {:?}", lhs, rhs)),
+            None => panic!("Cannot compare {:?} and {:?}", lhs, rhs),
         };
         let filter = match self.compare {
             Op::Eq => cmp == Ordering::Equal,
@@ -128,12 +138,11 @@ impl<T: Operator> Operator for FilterOp<T> {
             Op::Ge => cmp != Ordering::Less,
         };
         if filter {
-            self.op.execute(cell)?;
+            self.op.execute(cell);
         }
-        Ok(())
     }
 
-    fn finish(self) -> Result<()> {
+    fn finish(self) {
         self.op.finish()
     }
 }

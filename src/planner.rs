@@ -1,11 +1,10 @@
 use anyhow::{anyhow, bail, Result};
-use itertools::{process_results, Itertools};
 
 use crate::{
     operators::Op,
     page::Page,
     runtime::{LeafOp, PhysicalPlan, Scan},
-    schema::{Schema, TableType},
+    schema::{Schema, TableDef, TableType},
     values::Val,
     Sqlite,
 };
@@ -45,17 +44,15 @@ impl<'a> Plan<'a> {
     pub fn translate(self, db: &mut Sqlite) -> Result<PhysicalPlan> {
         let from_table = self.table;
 
-        let Page::LeafTable(root_page) = db.page(0)? else {
-            bail!("Root page is not a leaf table page");
+        let Page::LeafTable(root_page) = db.page(0) else {
+            panic!("Root page is not a leaf table page");
         };
 
-        let (mut table_schemas, index_schemas): (Vec<_>, Vec<_>) = process_results(
-            root_page
-                .iter()
-                .map(|cell| Schema::from_record(&cell.payload))
-                .filter_ok(|create_table| create_table.table_name() == from_table),
-            |i| i.partition(|s| s.typ() == TableType::Table),
-        )?;
+        let (mut table_schemas, index_schemas): (Vec<_>, Vec<_>) = root_page
+            .iter()
+            .map(|cell| Schema::from_record(cell.payload))
+            .filter(|schema| schema.table_name() == from_table)
+            .partition(|schema| schema.typ() == TableType::Table);
 
         let table_schema = table_schemas
             .pop()
@@ -67,48 +64,19 @@ impl<'a> Plan<'a> {
 
         let table_def = table_schema.table_def()?;
 
-        let op = match self.op {
-            LogicalOp::Count => LeafOp::Count,
-            LogicalOp::SelectAll => LeafOp::SelectAll,
-            LogicalOp::Select(columns) => {
-                let mut columns = columns
-                    .into_iter()
-                    .map(|col| {
-                        table_def
-                            .iter()
-                            .position(|c| c.name == col)
-                            .ok_or_else(|| anyhow!("Column not found: {}", col))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                if columns.is_empty() {
-                    bail!("No columns selected");
-                }
-
-                if columns.iter().copied().eq(0..table_def.len()) {
-                    LeafOp::SelectAll
-                } else {
-                    let last = columns.pop().unwrap();
-                    LeafOp::Select {
-                        init: columns,
-                        last,
-                    }
-                }
-            }
-        };
+        let op = translate_op(&table_def, self.op)?;
 
         if let Some(filter) = self.filter {
+            #[cfg(not(disable_index))]
             for index in index_schemas {
                 let index_def = index.index_def()?;
                 if *index_def == [filter.column] {
                     let scan = Scan::Index {
                         root_page: index.root_page(),
-                        column: 0,
                         value: filter.value,
-                        op,
                     };
 
-                    return Ok(PhysicalPlan::new(table_schema.root_page(), scan));
+                    return Ok(PhysicalPlan::new(table_schema.root_page(), scan, op));
                 }
             }
 
@@ -121,15 +89,51 @@ impl<'a> Plan<'a> {
                 column,
                 value: filter.value,
                 compare: filter.op,
-                op,
             };
 
-            return Ok(PhysicalPlan::new(table_schema.root_page(), scan));
+            return Ok(PhysicalPlan::new(table_schema.root_page(), scan, op));
         }
 
         Ok(PhysicalPlan::new(
             table_schema.root_page(),
-            Scan::FullTable { op },
+            Scan::FullTable,
+            op,
         ))
     }
+}
+
+fn translate_op(table: &TableDef, op: LogicalOp) -> Result<LeafOp> {
+    Ok(match op {
+        LogicalOp::Count => LeafOp::Count,
+        LogicalOp::SelectAll => {
+            let primary_key = table
+                .iter()
+                .position(|c| c.primary_key)
+                .unwrap_or(usize::MAX);
+
+            LeafOp::SelectAll { primary_key }
+        }
+        LogicalOp::Select(columns) => {
+            let columns = columns
+                .into_iter()
+                .map(|col| {
+                    table
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, c)| (c.name == col).then_some((index, c.primary_key)))
+                        .ok_or_else(|| anyhow!("Column not found: {}", col))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            if columns.is_empty() {
+                bail!("No columns selected");
+            }
+
+            if columns.iter().map(|(idx, _)| *idx).eq(0..table.len()) {
+                translate_op(table, LogicalOp::SelectAll)?
+            } else {
+                LeafOp::Select { columns }
+            }
+        }
+    })
 }
