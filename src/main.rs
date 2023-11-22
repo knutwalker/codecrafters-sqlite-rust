@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, ensure, Result};
-use itertools::Itertools;
+use itertools::{process_results, Itertools};
 use nom::{
     branch::alt,
     bytes::complete::{escaped_transform, tag, tag_no_case, take_until1, take_while1},
@@ -12,29 +12,16 @@ use nom::{
 };
 use std::{
     borrow::Cow,
-    cmp::{Ordering, Reverse},
+    cmp::Ordering,
     collections::VecDeque,
     ffi::CStr,
     fmt::Display,
     fs::File,
     io::{Read as _, Seek as _, SeekFrom},
+    iter::once,
     mem::size_of,
     rc::Rc,
 };
-
-#[cfg(not(debug_assertions))]
-macro_rules! ddbg {
-    ($e:expr) => {
-        $e
-    };
-}
-
-#[cfg(debug_assertions)]
-macro_rules! ddbg {
-    ($e:expr) => {
-        dbg!($e)
-    };
-}
 
 fn main() -> Result<()> {
     // Parse arguments
@@ -53,38 +40,40 @@ fn main() -> Result<()> {
     match command {
         ".dbinfo" => {
             let page_size = db.header.page_size;
-
-            let mut num_tables = 0;
-            let root_page = db.page(0)?;
-            for cell in root_page.cells.iter() {
-                let create_table = match cell {
-                    Cell::LeafTable(cell) => Schema::from_record(&cell.payload)?,
-                    otherwise => bail!("Invalid root page cell: {:?}", otherwise),
-                };
-                if matches!(create_table.typ, TableType::Table) {
-                    num_tables += 1;
-                }
-            }
-
             println!("database page size: {}", page_size);
+
+            let Page::LeafTable(root_page) = db.page(0)? else {
+                bail!("Root page is not a leaf table page");
+            };
+
+            let num_tables = process_results(
+                root_page
+                    .cells
+                    .iter()
+                    .map(|cell| Schema::from_record(&cell.payload))
+                    .filter_ok(|ct| ct.typ == TableType::Table),
+                |tables| tables.count(),
+            )?;
+
             println!("number of tables: {}", num_tables);
         }
         ".tables" => {
-            let root_page = db.page(0)?;
+            let Page::LeafTable(root_page) = db.page(0)? else {
+                bail!("Root page is not a leaf table page");
+            };
 
-            for cell in root_page.cells.iter() {
-                let create_table = match cell {
-                    Cell::LeafTable(cell) => Schema::from_record(&cell.payload)?,
-                    otherwise => bail!("Invalid root page cell: {:?}", otherwise),
-                };
-                if matches!(create_table.typ, TableType::Table) {
-                    print!("{} ", create_table.table_name);
-                }
-            }
+            process_results(
+                root_page
+                    .cells
+                    .iter()
+                    .map(|cell| Schema::from_record(&cell.payload))
+                    .filter_map_ok(|ct| (ct.typ == TableType::Table).then_some(ct.table_name)),
+                |tables| tables.for_each(|table| println!("{}", table)),
+            )?;
         }
         query => {
-            let plan = ddbg!(parse_query(query))?;
-            let plan = ddbg!(plan.translate(&mut db))?;
+            let plan = parse_query(query)?;
+            let plan = plan.translate(&mut db)?;
             plan.execute(&mut db)?;
         }
     };
@@ -109,47 +98,67 @@ enum LogicalOp<'a> {
 #[derive(Clone, Debug, PartialEq)]
 struct PhysicalPlan {
     root_page: usize,
-    op: PhysicalOp,
-    filter: Option<PhysicalFilter>,
+    scan: Scan,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-enum PhysicalOp {
+enum Scan {
+    Index {
+        root_page: usize,
+        column: usize,
+        value: Val,
+        op: LeafOp,
+    },
+    Table {
+        column: usize,
+        value: Val,
+        compare: Op,
+        op: LeafOp,
+    },
+    FullTable {
+        op: LeafOp,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LeafOp {
     Count,
     SelectAll,
-    Select(Vec<usize>),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct PhysicalFilter {
-    column: usize,
-    op: Op,
-    value: Val,
+    Select { init: Vec<usize>, last: usize },
 }
 
 impl Plan<'_> {
     fn translate(self, db: &mut Sqlite) -> Result<PhysicalPlan> {
         let from_table = self.table;
 
-        let schema = db
-            .page(0)?
-            .cells
-            .iter()
-            .map(|cell| match cell {
-                Cell::LeafTable(cell) => Schema::from_record(&cell.payload),
-                otherwise => bail!("Invalid root page cell: {:?}", otherwise),
-            })
-            .filter_ok(|create_table| &*create_table.table_name == from_table)
-            .next()
-            .ok_or_else(|| anyhow!("Table not found: {}", from_table))??;
+        let Page::LeafTable(root_page) = db.page(0)? else {
+            bail!("Root page is not a leaf table page");
+        };
 
-        let table_def = TableDef::from_sql(&schema.sql)?;
+        let (mut table_schemas, index_schemas): (Vec<_>, Vec<_>) = process_results(
+            root_page
+                .cells
+                .iter()
+                .map(|cell| Schema::from_record(&cell.payload))
+                .filter_ok(|create_table| &*create_table.table_name == from_table),
+            |i| i.partition(|s| s.typ == TableType::Table),
+        )?;
+
+        let table_schema = table_schemas
+            .pop()
+            .ok_or_else(|| anyhow!("Table not found: {}", from_table))?;
+
+        if !table_schemas.is_empty() {
+            bail!("Ambiguous table name: {}", from_table);
+        }
+
+        let table_def = TableDef::from_sql(&table_schema.sql)?;
 
         let op = match self.op {
-            LogicalOp::Count => PhysicalOp::Count,
-            LogicalOp::SelectAll => PhysicalOp::SelectAll,
+            LogicalOp::Count => LeafOp::Count,
+            LogicalOp::SelectAll => LeafOp::SelectAll,
             LogicalOp::Select(columns) => {
-                let columns = columns
+                let mut columns = columns
                     .into_iter()
                     .map(|col| {
                         table_def
@@ -165,90 +174,232 @@ impl Plan<'_> {
                 }
 
                 if columns.iter().copied().eq(0..table_def.columns.len()) {
-                    PhysicalOp::SelectAll
+                    LeafOp::SelectAll
                 } else {
-                    PhysicalOp::Select(columns)
+                    let last = columns.pop().unwrap();
+                    LeafOp::Select {
+                        init: columns,
+                        last,
+                    }
                 }
             }
         };
 
-        let filter = self
-            .filter
-            .map(|o| -> Result<PhysicalFilter> {
-                let column = table_def
-                    .columns
-                    .iter()
-                    .position(|c| c.name == o.column)
-                    .ok_or_else(|| anyhow!("Column not found: {}", o.column))?;
+        if let Some(filter) = self.filter {
+            for index in index_schemas {
+                let index_def = IndexDef::from_sql(&index.sql)?;
+                if index_def.columns == [filter.column] {
+                    let scan = Scan::Index {
+                        root_page: index.root_page,
+                        column: 0,
+                        value: filter.value,
+                        op,
+                    };
 
-                Ok(PhysicalFilter {
-                    column,
-                    op: o.op,
-                    value: o.value,
-                })
-            })
-            .transpose()?;
+                    return Ok(PhysicalPlan {
+                        root_page: table_schema.root_page,
+                        scan,
+                    });
+                }
+            }
+
+            let column = table_def
+                .columns
+                .iter()
+                .position(|c| c.name == filter.column)
+                .ok_or_else(|| anyhow!("Column not found: {}", filter.column))?;
+
+            let scan = Scan::Table {
+                column,
+                value: filter.value,
+                compare: filter.op,
+                op,
+            };
+
+            return Ok(PhysicalPlan {
+                root_page: table_schema.root_page,
+                scan,
+            });
+        }
 
         Ok(PhysicalPlan {
-            root_page: schema.root_page,
-            op,
-            filter,
+            root_page: table_schema.root_page,
+            scan: Scan::FullTable { op },
         })
     }
 }
 
 impl PhysicalPlan {
-    fn execute(&self, db: &mut Sqlite) -> Result<()> {
-        match self.op {
-            PhysicalOp::Count => self.execute_op(db, Count(0)),
-            PhysicalOp::SelectAll => self.execute_op(db, SelectAll),
-            PhysicalOp::Select(ref columns) => {
-                let (&last, init) = columns.split_last().unwrap();
-                self.execute_op(db, Select(init, last))
-            }
-        }
-    }
-
-    fn execute_op(&self, db: &mut Sqlite, mut operator: impl Operator) -> Result<()> {
-        let mut stack = VecDeque::new();
-        stack.push_back(self.root_page);
-
-        while let Some(page) = stack.pop_front() {
-            let page = db.page(page)?;
-            for cell in &*page.cells {
-                match cell {
-                    Cell::LeafTable(cell) => {
-                        if let Some(ref filter) = self.filter {
-                            let lhs = &filter.value;
-                            let rhs = &cell.payload.values[filter.column];
-                            let cmp = match compare(lhs, rhs) {
-                                Some(cmp) => cmp,
-                                None => {
-                                    return Err(anyhow!("Cannot compare {:?} and {:?}", lhs, rhs))
-                                }
-                            };
-                            let filter = match filter.op {
-                                Op::Eq => cmp == Ordering::Equal,
-                                Op::Ne => cmp != Ordering::Equal,
-                                Op::Lt => cmp == Ordering::Less,
-                                Op::Le => cmp != Ordering::Greater,
-                                Op::Gt => cmp == Ordering::Greater,
-                                Op::Ge => cmp != Ordering::Less,
-                            };
-                            if !filter {
-                                continue;
-                            }
-                        }
-                        operator.execute(cell)?;
-                    }
-                    Cell::InteriorTable(cell) => {
-                        stack.push_back(cell.left_ptr as usize);
+    fn execute(self, db: &mut Sqlite) -> Result<()> {
+        match self.scan {
+            Scan::Index {
+                root_page,
+                column,
+                value,
+                op,
+            } => {
+                let row_ids = Self::index_scan(db, root_page, column, value)?;
+                match op {
+                    LeafOp::Count => Count(row_ids.len()).finish(),
+                    LeafOp::SelectAll => Self::seek_all(db, self.root_page, row_ids, SelectAll),
+                    LeafOp::Select { init, last } => {
+                        Self::seek_all(db, self.root_page, row_ids, Select(init, last))
                     }
                 }
             }
+            Scan::Table {
+                column,
+                value,
+                compare,
+                op,
+            } => match op {
+                LeafOp::Count => Self::table_scan_op(
+                    db,
+                    self.root_page,
+                    Count(0).filtered(column, value, compare),
+                ),
+                LeafOp::SelectAll => Self::table_scan_op(
+                    db,
+                    self.root_page,
+                    SelectAll.filtered(column, value, compare),
+                ),
+                LeafOp::Select { init, last } => Self::table_scan_op(
+                    db,
+                    self.root_page,
+                    Select(init, last).filtered(column, value, compare),
+                ),
+            },
+            Scan::FullTable { op } => match op {
+                LeafOp::Count => Self::table_scan_op(db, self.root_page, Count(0)),
+                LeafOp::SelectAll => Self::table_scan_op(db, self.root_page, SelectAll),
+                LeafOp::Select { init, last } => {
+                    Self::table_scan_op(db, self.root_page, Select(init, last))
+                }
+            },
+        }
+    }
+
+    fn index_scan(
+        db: &mut Sqlite,
+        index_root: usize,
+        index_column: usize,
+        condition: Val,
+    ) -> Result<Vec<u64>> {
+        let mut row_ids = Vec::new();
+        let mut next_pages = VecDeque::new();
+        next_pages.push_back(index_root);
+
+        while let Some(page_id) = next_pages.pop_front() {
+            let page = db.page(page_id)?;
+
+            match page {
+                Page::LeafTable(_) | Page::InteriorTable(_) => bail!("Expected index page"),
+                Page::LeafIndex(page) => {
+                    let lower = page
+                        .cells
+                        .partition_point(|cell| cell.lower_bound(index_column, &condition));
+                    let upper = page
+                        .cells
+                        .partition_point(|cell| cell.upper_bound(index_column, &condition));
+
+                    row_ids.extend(page.cells[lower..upper].iter().map(|cell| cell.row_id));
+                }
+                Page::InteriorIndex(page) => {
+                    let lower = page
+                        .cells
+                        .partition_point(|cell| cell.lower_bound(index_column, &condition));
+                    let upper = page
+                        .cells
+                        .partition_point(|cell| cell.upper_bound(index_column, &condition));
+
+                    row_ids.extend(page.cells[lower..upper].iter().map(|cell| cell.cell.row_id));
+
+                    next_pages.extend(
+                        page.cells[lower..upper]
+                            .iter()
+                            .map(|cell| cell.left_ptr)
+                            .chain(once(
+                                page.cells
+                                    .get(upper)
+                                    .map_or(page.right_ptr, |cell| cell.left_ptr),
+                            ))
+                            .map(|ptr| ptr as usize),
+                    );
+                }
+            };
+        }
+
+        Ok(row_ids)
+    }
+
+    fn table_scan_op(db: &mut Sqlite, root_page: usize, mut operator: impl Operator) -> Result<()> {
+        let mut stack = VecDeque::new();
+        stack.push_back(root_page);
+
+        while let Some(page) = stack.pop_front() {
+            let page = db.page(page)?;
+
+            match page {
+                Page::LeafTable(page) => {
+                    for cell in &*page.cells {
+                        operator.execute(cell)?;
+                    }
+                }
+                Page::InteriorTable(page) => {
+                    stack.extend(page.cells.iter().map(|cell| cell.left_ptr as usize));
+                    stack.push_back(page.right_ptr as usize);
+                }
+                Page::LeafIndex(_) | Page::InteriorIndex(_) => bail!("Expected table page"),
+            };
         }
 
         operator.finish()
+    }
+
+    fn seek_all(
+        db: &mut Sqlite,
+        root_page: usize,
+        keys: impl IntoIterator<Item = u64> + std::fmt::Debug,
+        mut operator: impl Operator,
+    ) -> Result<()> {
+        for key in keys {
+            Self::seek_op(db, root_page, key, &mut operator)?;
+        }
+        operator.finish()
+    }
+
+    fn seek_op(
+        db: &mut Sqlite,
+        root_page: usize,
+        key: u64,
+        operator: &mut impl Operator,
+    ) -> Result<()> {
+        let mut next_page = Some(root_page);
+
+        while let Some(page_id) = next_page.take() {
+            let page = db.page(page_id)?;
+
+            match page {
+                Page::LeafIndex(_) | Page::InteriorIndex(_) => bail!("Expected table page"),
+                Page::LeafTable(page) => {
+                    if let Ok(idx) = page.cells.binary_search_by_key(&key, |cell| cell.row_id) {
+                        operator.execute(&page.cells[idx])?;
+                    };
+                }
+                Page::InteriorTable(page) => {
+                    let next_ptr = match page.cells.binary_search_by_key(&key, |cell| cell.row_id) {
+                        Ok(idx) => page.cells[idx].left_ptr,
+                        Err(idx) => page
+                            .cells
+                            .get(idx)
+                            .map_or(page.right_ptr, |cell| cell.left_ptr),
+                    };
+                    next_page = Some(next_ptr as usize);
+                }
+            };
+        }
+
+        Ok(())
     }
 }
 
@@ -256,6 +407,18 @@ trait Operator {
     fn execute(&mut self, cell: &LeafTableCell) -> Result<()>;
 
     fn finish(self) -> Result<()>;
+
+    fn filtered(self, column: usize, value: Val, compare: Op) -> FilterOp<Self>
+    where
+        Self: Sized,
+    {
+        FilterOp {
+            column,
+            value,
+            compare,
+            op: self,
+        }
+    }
 }
 
 impl<T: Operator> Operator for &mut T {
@@ -300,11 +463,11 @@ impl Operator for SelectAll {
     }
 }
 
-struct Select<'a>(&'a [usize], usize);
+struct Select(Vec<usize>, usize);
 
-impl<'a> Operator for Select<'a> {
+impl Operator for Select {
     fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
-        for &idx in self.0 {
+        for &idx in &self.0 {
             print!("{}|", cell.payload.values[idx]);
         }
         print!("{}", cell.payload.values[self.1]);
@@ -314,6 +477,40 @@ impl<'a> Operator for Select<'a> {
 
     fn finish(self) -> Result<()> {
         Ok(())
+    }
+}
+
+struct FilterOp<T> {
+    column: usize,
+    value: Val,
+    compare: Op,
+    op: T,
+}
+
+impl<T: Operator> Operator for FilterOp<T> {
+    fn execute(&mut self, cell: &LeafTableCell) -> Result<()> {
+        let lhs = &self.value;
+        let rhs = &cell.payload.values[self.column];
+        let cmp = match compare(lhs, rhs) {
+            Some(cmp) => cmp,
+            None => return Err(anyhow!("Cannot compare {:?} and {:?}", lhs, rhs)),
+        };
+        let filter = match self.compare {
+            Op::Eq => cmp == Ordering::Equal,
+            Op::Ne => cmp != Ordering::Equal,
+            Op::Lt => cmp == Ordering::Less,
+            Op::Le => cmp != Ordering::Greater,
+            Op::Gt => cmp == Ordering::Greater,
+            Op::Ge => cmp != Ordering::Less,
+        };
+        if filter {
+            self.op.execute(cell)?;
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> Result<()> {
+        self.op.finish()
     }
 }
 
@@ -374,7 +571,7 @@ fn parse_create_table_schema(sql: &str) -> IResult<&str, TableDef<'_>> {
                     terminated(tag_no_case("TABLE"), multispace1),
                 ),
             ),
-            alt((delimited(tag("\""), name, tag("\"")), name)),
+            quoted_name,
             delimited(
                 delimited(multispace0, tag("("), multispace0),
                 separated_list1(delimited(multispace0, tag(","), multispace0), column_def),
@@ -389,10 +586,18 @@ fn name(s: &str) -> IResult<&str, &str> {
     take_while1(|c: char| c.is_ascii_alphanumeric() || c == '_')(s)
 }
 
+fn ws_name(s: &str) -> IResult<&str, &str> {
+    take_while1(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ' ')(s)
+}
+
+fn quoted_name(s: &str) -> IResult<&str, &str> {
+    alt((delimited(tag("\""), ws_name, tag("\"")), name))(s)
+}
+
 fn column_def(s: &str) -> IResult<&str, ColumnDef<'_>> {
     map(
         tuple((
-            name,
+            quoted_name,
             opt(preceded(multispace1, name)),
             value((), opt(take_until1(","))),
         )),
@@ -404,6 +609,28 @@ fn column_def(s: &str) -> IResult<&str, ColumnDef<'_>> {
     )(s)
 }
 
+fn parse_create_index_schema(sql: &str) -> IResult<&str, IndexDef<'_>> {
+    all_consuming(map(
+        tuple((
+            value(
+                (),
+                tuple((
+                    terminated(tag_no_case("CREATE"), multispace1),
+                    terminated(tag_no_case("INDEX"), multispace1),
+                    quoted_name,
+                    delimited(multispace1, tag_no_case("ON"), multispace1),
+                    quoted_name,
+                )),
+            ),
+            delimited(
+                delimited(multispace0, tag("("), multispace0),
+                separated_list1(delimited(multispace0, tag(","), multispace0), quoted_name),
+                delimited(multispace0, tag(")"), multispace0),
+            ),
+        )),
+        |(_, columns)| IndexDef { columns },
+    ))(sql)
+}
 #[derive(Clone, Debug, PartialEq)]
 struct Filter<'a> {
     op: Op,
@@ -421,12 +648,30 @@ enum Op {
     Ge,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+struct TotalFloat(f64);
+
+impl Eq for TotalFloat {}
+
+impl Ord for TotalFloat {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+impl PartialOrd for TotalFloat {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 enum Val {
+    #[default]
     Null,
     Bool(bool),
     Int(i64),
-    Float(f64),
+    Float(TotalFloat),
     Text(String),
 }
 
@@ -454,29 +699,27 @@ fn expr(s: &str) -> IResult<&str, Val> {
         value(Val::Bool(true), tag_no_case("TRUE")),
         value(Val::Bool(false), tag_no_case("FALSE")),
         map(i64, Val::Int),
-        map(double, Val::Float),
-        alt((
-            preceded(
+        map(double, |o| Val::Float(TotalFloat(o))),
+        map(string, Val::Text),
+    ))(s)
+}
+
+fn string(s: &str) -> IResult<&str, String> {
+    alt((
+        preceded(
+            tag("\""),
+            cut(terminated(
+                escaped_transform(none_of(r#"\""#), '\\', one_of(r#""n\"#)),
                 tag("\""),
-                cut(terminated(
-                    map(
-                        escaped_transform(none_of(r#"\""#), '\\', one_of(r#""n\"#)),
-                        Val::Text,
-                    ),
-                    tag("\""),
-                )),
-            ),
-            preceded(
+            )),
+        ),
+        preceded(
+            tag("'"),
+            cut(terminated(
+                escaped_transform(none_of(r#"\'"#), '\\', one_of(r#"'n\"#)),
                 tag("'"),
-                cut(terminated(
-                    map(
-                        escaped_transform(none_of(r#"\'"#), '\\', one_of(r#"'n\"#)),
-                        Val::Text,
-                    ),
-                    tag("'"),
-                )),
-            ),
-        )),
+            )),
+        ),
     ))(s)
 }
 
@@ -491,6 +734,20 @@ impl<'a> TableDef<'a> {
         Ok(parse_create_table_schema(sql)
             .finish()
             .map_err(|e| anyhow!("Unknown table schema: {} ({})", sql, e))?
+            .1)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct IndexDef<'a> {
+    columns: Vec<&'a str>,
+}
+
+impl<'a> IndexDef<'a> {
+    fn from_sql(sql: &'a str) -> Result<Self> {
+        Ok(parse_create_index_schema(sql)
+            .finish()
+            .map_err(|e| anyhow!("Unknown index schema: {} ({})", sql, e))?
             .1)
     }
 }
@@ -638,7 +895,6 @@ impl LazyPage {
         match self {
             LazyPage::Loaded(page) => Ok(page),
             LazyPage::Unloaded => {
-                ddbg!(page_number);
                 let page_size = db_header.page_size;
                 let file_offset = page_number * page_size;
                 file.seek(SeekFrom::Start(u64::try_from(file_offset)?))?;
@@ -655,7 +911,7 @@ impl LazyPage {
 
                 let page = &page[..page_size - db_header.reserved_size];
                 let page_start = 100 * usize::from(page_number == 0);
-                let page = Page::from_bytes(db_header.text_encoding, page, page_start)?;
+                let page = Page::from_bytes(db_header, page, page_start)?;
                 *self = Self::Loaded(page);
 
                 let LazyPage::Loaded(page) = self else {
@@ -668,13 +924,37 @@ impl LazyPage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Page {
-    page_type: PageType,
-    cells: Box<[Cell]>,
+enum Page {
+    LeafTable(LeafTablePage),
+    InteriorTable(InteriorTablePage),
+    LeafIndex(LeafIndexPage),
+    InteriorIndex(InteriorIndexPage),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LeafTablePage {
+    cells: Box<[LeafTableCell]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InteriorTablePage {
+    right_ptr: u32,
+    cells: Box<[InteriorTableCell]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LeafIndexPage {
+    cells: Box<[LeafIndexCell]>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct InteriorIndexPage {
+    right_ptr: u32,
+    cells: Box<[InteriorIndexCell]>,
 }
 
 impl Page {
-    fn from_bytes(text_encoding: TextEncoding, page: &[u8], header_start: usize) -> Result<Self> {
+    fn from_bytes(db_header: &DbHeader, page: &[u8], header_start: usize) -> Result<Self> {
         ensure!(
             page.len() >= header_start + size_of::<PageHeaderStruct>(),
             "Page of length {} is not big enough",
@@ -702,7 +982,7 @@ impl Page {
                     page.len()
                 );
                 let (right_ptr, content) = content.split_at(4);
-                let right_ptr = u32::from_be_bytes(right_ptr.try_into()?);
+                let right_ptr = u32::from_be_bytes(right_ptr.try_into()?) - 1;
                 (right_ptr, content)
             }
             _ => (u32::MAX, content),
@@ -717,80 +997,49 @@ impl Page {
             page.len(),
         );
 
-        let cells = match page_type {
-            PageType::InteriorIndex | PageType::InteriorTable => {
-                let mut cells = content[..number_of_cells * 2]
-                    .chunks_exact(2)
-                    .map(|v| u16::from_be_bytes([v[0], v[1]]))
-                    .map(usize::from)
-                    .map(|pos| &page[pos..])
-                    .map(|cell| Cell::from_bytes(text_encoding, page_type, cell))
+        let cells = content[..number_of_cells * 2]
+            .chunks_exact(2)
+            .map(|v| u16::from_be_bytes([v[0], v[1]]))
+            .map(usize::from)
+            .map(|pos| &page[pos..]);
+
+        Ok(match page_type {
+            PageType::LeafTable => {
+                let cells = cells
+                    .map(|cell| LeafTableCell::from_bytes(db_header, cell))
                     .collect::<Result<Vec<_>>>()?;
-
-                cells.push(Cell::InteriorTable(InteriorTableCell::from_values(
-                    right_ptr,
-                    u64::MAX,
-                )?));
-
-                cells
+                Self::LeafTable(LeafTablePage {
+                    cells: cells.into_boxed_slice(),
+                })
             }
-            PageType::LeafIndex | PageType::LeafTable => {
-                let mut cell_positions = content[..number_of_cells * 2]
-                    .chunks_exact(2)
-                    .map(|v| u16::from_be_bytes([v[0], v[1]]))
-                    .map(usize::from)
-                    .collect::<Vec<_>>();
-
-                cell_positions.sort_unstable_by_key(|o| Reverse(*o));
-
-                let mut cells = Vec::with_capacity(number_of_cells);
-
-                let mut page = page;
-                for pos in cell_positions {
-                    ensure!(
-                        pos >= content_start,
-                        "Cell offset {} cannot be before content start ({})",
-                        pos,
-                        content_start
-                    );
-
-                    let (rest, cell) = page.split_at(pos);
-                    page = rest;
-
-                    let cell = Cell::from_bytes(text_encoding, page_type, cell)?;
-                    cells.push(cell);
-                }
-
-                cells
-            }
-        };
-
-        Ok(Self {
-            page_type,
-            cells: cells.into_boxed_slice(),
-        })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum Cell {
-    InteriorTable(InteriorTableCell),
-    LeafTable(LeafTableCell),
-}
-
-impl Cell {
-    fn from_bytes(text_encoding: TextEncoding, typ: PageType, bytes: &[u8]) -> Result<Self> {
-        match typ {
-            PageType::InteriorIndex => todo!(),
             PageType::InteriorTable => {
-                Ok(Self::InteriorTable(InteriorTableCell::from_bytes(bytes)?))
+                let cells = cells
+                    .map(InteriorTableCell::from_bytes)
+                    .collect::<Result<Vec<_>>>()?;
+                Self::InteriorTable(InteriorTablePage {
+                    right_ptr,
+                    cells: cells.into_boxed_slice(),
+                })
             }
-            PageType::LeafIndex => todo!(),
-            PageType::LeafTable => Ok(Self::LeafTable(LeafTableCell::from_bytes(
-                text_encoding,
-                bytes,
-            )?)),
-        }
+            PageType::LeafIndex => {
+                let cells = cells
+                    .enumerate()
+                    .map(|(index, cell)| LeafIndexCell::from_bytes(db_header, index, cell))
+                    .collect::<Result<Vec<_>>>()?;
+                Self::LeafIndex(LeafIndexPage {
+                    cells: cells.into_boxed_slice(),
+                })
+            }
+            PageType::InteriorIndex => {
+                let cells = cells
+                    .map(|cell| InteriorIndexCell::from_bytes(db_header, cell))
+                    .collect::<Result<Vec<_>>>()?;
+                Self::InteriorIndex(InteriorIndexPage {
+                    right_ptr,
+                    cells: cells.into_boxed_slice(),
+                })
+            }
+        })
     }
 }
 
@@ -802,37 +1051,146 @@ struct LeafTableCell {
 }
 
 impl LeafTableCell {
-    fn from_bytes(text_encoding: TextEncoding, bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(header: &DbHeader, bytes: &[u8]) -> Result<Self> {
         let (payload_size, bytes, _) = read_varint(bytes)?;
         let payload_size = usize::try_from(payload_size)
             .map_err(|_| anyhow!("Invalid payload size: {}", payload_size))?;
 
-        let (row_id, mut bytes, _) = read_varint(bytes)?;
+        let (row_id, bytes, _) = read_varint(bytes)?;
 
-        let mut overflow = None;
-
-        if payload_size > bytes.len() {
-            let overflow_point = bytes.len().checked_sub(4).ok_or_else(|| {
-                anyhow!(
-                    "Invalid payload size: {} (need at least 4 bytes, but only got {})",
-                    payload_size,
-                    bytes.len()
-                )
-            })?;
-            let (payload, overflow_page) = bytes.split_at(overflow_point);
-            let overflow_page = u32::from_be_bytes(overflow_page.try_into()?);
-            overflow = Some(Overflow {
-                page: overflow_page,
-                spilled_length: payload_size - payload.len(),
+        let usable = header.page_size.saturating_sub(header.reserved_size);
+        let max_inline_size = usable.saturating_sub(35);
+        if payload_size <= max_inline_size {
+            let payload = Record::from_bytes(header.text_encoding, Some(row_id), bytes)?;
+            return Ok(Self {
+                row_id,
+                payload,
+                overflow: None,
             });
-            bytes = payload;
         }
 
-        let payload = Record::from_bytes(text_encoding, row_id, bytes)?;
+        let min_inline_size = usable
+            .saturating_sub(12)
+            .saturating_mul(32)
+            .saturating_div(255)
+            .saturating_sub(23);
+        let cutoff_size = payload_size
+            .saturating_sub(min_inline_size)
+            .wrapping_rem(usable.saturating_sub(4))
+            .saturating_add(min_inline_size);
+
+        let stored_size = if cutoff_size <= max_inline_size {
+            cutoff_size
+        } else {
+            min_inline_size
+        };
+
+        ensure!(bytes.len() >= stored_size + 4, "Not enough bytes, need at least {} bytes for the payload and 4 bytes for the overflow page", stored_size);
+        let (bytes, overflow) = bytes.split_at(cutoff_size);
+        let overflow_page = u32::from_be_bytes(overflow[..4].try_into()?);
+
+        let payload = Record::from_bytes(header.text_encoding, Some(row_id), bytes)?;
+        let overflow = Some(Overflow {
+            page: overflow_page,
+            spilled_length: payload_size - stored_size,
+        });
 
         Ok(Self {
             row_id,
             payload,
+            overflow,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LeafIndexCell {
+    index: usize,
+    payload: Record,
+    row_id: u64,
+    overflow: Option<Overflow>,
+}
+
+impl LeafIndexCell {
+    fn lower_bound(&self, filter: usize, condition: &Val) -> bool {
+        self.compare(filter, condition) == Ordering::Greater
+    }
+
+    fn upper_bound(&self, filter: usize, condition: &Val) -> bool {
+        self.compare(filter, condition) != Ordering::Less
+    }
+
+    fn compare(&self, filter: usize, lhs: &Val) -> Ordering {
+        let rhs = &self.payload.values[filter];
+        match compare(lhs, rhs) {
+            Some(cmp) => cmp,
+            None => panic!("Cannot compare {:?} and {:?}", lhs, rhs),
+        }
+    }
+
+    fn from_bytes(header: &DbHeader, index: usize, bytes: &[u8]) -> Result<Self> {
+        let (payload_size, bytes, _) = read_varint(bytes)?;
+        let payload_size = usize::try_from(payload_size)
+            .map_err(|_| anyhow!("Invalid payload size: {}", payload_size))?;
+
+        let usable = header.page_size.saturating_sub(header.reserved_size);
+        let max_inline_size = usable
+            .saturating_sub(12)
+            .saturating_mul(64)
+            .saturating_div(255)
+            .saturating_sub(23);
+        if payload_size <= max_inline_size {
+            let payload = Record::values_from_bytes(header.text_encoding, None, bytes)?;
+            return Self::from_values(payload, index, None);
+        }
+
+        let min_inline_size = usable
+            .saturating_sub(12)
+            .saturating_mul(32)
+            .saturating_div(255)
+            .saturating_sub(23);
+        let cutoff_size = payload_size
+            .saturating_sub(min_inline_size)
+            .wrapping_rem(usable.saturating_sub(4))
+            .saturating_add(min_inline_size);
+
+        let stored_size = if cutoff_size <= max_inline_size {
+            cutoff_size
+        } else {
+            min_inline_size
+        };
+
+        ensure!(bytes.len() >= stored_size + 4, "Not enough bytes, need at least {} bytes for the payload and 4 bytes for the overflow page", stored_size);
+        let (bytes, overflow) = bytes.split_at(cutoff_size);
+        let overflow_page = u32::from_be_bytes(overflow[..4].try_into()?);
+
+        let payload = Record::values_from_bytes(header.text_encoding, None, bytes)?;
+
+        let overflow = Some(Overflow {
+            page: overflow_page,
+            spilled_length: payload_size - stored_size,
+        });
+
+        Self::from_values(payload, index, overflow)
+    }
+
+    fn from_values(
+        mut payload: Vec<Value>,
+        index: usize,
+        overflow: Option<Overflow>,
+    ) -> Result<Self> {
+        let Some(Value::Int(row_id)) = payload.pop() else {
+            bail!("Missing row id for index payload");
+        };
+        let row_id = row_id.try_into()?;
+        let payload = Record {
+            values: payload.into_boxed_slice(),
+        };
+
+        Ok(Self {
+            index,
+            payload,
+            row_id,
             overflow,
         })
     }
@@ -872,6 +1230,47 @@ impl InteriorTableCell {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct InteriorIndexCell {
+    left_ptr: u32,
+    cell: LeafIndexCell,
+}
+
+impl InteriorIndexCell {
+    fn lower_bound(&self, filter: usize, condition: &Val) -> bool {
+        self.cell.lower_bound(filter, condition)
+    }
+
+    fn upper_bound(&self, filter: usize, condition: &Val) -> bool {
+        self.cell.upper_bound(filter, condition)
+    }
+
+    fn from_bytes(header: &DbHeader, bytes: &[u8]) -> Result<Self> {
+        ensure!(
+            bytes.len() >= 4,
+            "Not enough bytes to read a cell: expected at least 4 but only {} were available",
+            bytes.len()
+        );
+
+        let (left_ptr, bytes) = bytes.split_at(4);
+        let left_ptr = u32::from_be_bytes(left_ptr.try_into()?);
+
+        let leaf = LeafIndexCell::from_bytes(header, usize::MAX, bytes)?;
+        Self::from_values(left_ptr, leaf)
+    }
+
+    fn from_values(left_ptr: u32, cell: LeafIndexCell) -> Result<Self> {
+        let left_ptr = left_ptr.checked_sub(1).ok_or_else(|| {
+            anyhow!(
+                "Invalid left pointer: {} (must be at least 1, but 0 is reserved)",
+                left_ptr
+            )
+        })?;
+
+        Ok(Self { left_ptr, cell })
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 struct Overflow {
     page: u32,
@@ -880,7 +1279,6 @@ struct Overflow {
 
 fn read_varint(bytes: &[u8]) -> Result<(u64, &[u8], usize)> {
     let mut result = 0;
-    let mut shift = 0;
     let mut bytes_read = 0;
 
     let mut bs = bytes.iter().copied();
@@ -892,12 +1290,11 @@ fn read_varint(bytes: &[u8]) -> Result<(u64, &[u8], usize)> {
         bytes_read += 1;
 
         if bytes_read == 9 {
-            result = (result << shift) | u64::from(byte);
+            result = (result << 7) | u64::from(byte);
             break;
         }
 
-        result = (result << shift) | u64::from(byte & 0b0111_1111);
-        shift += 7;
+        result = (result << 7) | u64::from(byte & 0b0111_1111);
 
         if byte & 0b1000_0000 == 0 {
             break;
@@ -913,7 +1310,18 @@ struct Record {
 }
 
 impl Record {
-    fn from_bytes(text_encoding: TextEncoding, row_id: u64, bytes: &[u8]) -> Result<Self> {
+    fn from_bytes(text_encoding: TextEncoding, row_id: Option<u64>, bytes: &[u8]) -> Result<Self> {
+        let values = Self::values_from_bytes(text_encoding, row_id, bytes)?;
+        Ok(Self {
+            values: values.into_boxed_slice(),
+        })
+    }
+
+    fn values_from_bytes(
+        text_encoding: TextEncoding,
+        row_id: Option<u64>,
+        bytes: &[u8],
+    ) -> Result<Vec<Value>> {
         let (header_size, bytes, header_size_length) = read_varint(bytes)?;
         let (mut header, mut bytes) =
             bytes.split_at(usize::try_from(header_size)? - header_size_length);
@@ -926,8 +1334,8 @@ impl Record {
             let (mut value, rest) = Value::from_bytes(text_encoding, serial_type, bytes)?;
             bytes = rest;
 
-            if let Value::Null = value {
-                if values.is_empty() {
+            if values.is_empty() {
+                if let (Value::Null, Some(row_id)) = (&value, row_id) {
                     value = Value::Int(row_id as i64);
                 }
             }
@@ -935,17 +1343,15 @@ impl Record {
             values.push(value);
         }
 
-        Ok(Self {
-            values: values.into_boxed_slice(),
-        })
+        Ok(values)
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Value {
     Null,
     Int(i64),
-    Float(f64),
+    Float(TotalFloat),
     Text(Rc<str>),
     Blob(Rc<[u8]>),
 }
@@ -967,7 +1373,7 @@ impl Value {
             7 => {
                 let (value, bytes) = Self::read_int(bytes, 8)?;
                 let value = f64::from_bits(value as u64);
-                Ok((Self::Float(value), bytes))
+                Ok((Self::Float(TotalFloat(value)), bytes))
             }
             8 => Ok((Self::Int(0), bytes)),
             9 => Ok((Self::Int(1), bytes)),
@@ -1019,7 +1425,7 @@ impl Display for Value {
         match self {
             Value::Null => write!(f, "NULL"),
             Value::Int(v) => write!(f, "{}", v),
-            Value::Float(v) => write!(f, "{}", v),
+            Value::Float(v) => write!(f, "{}", v.0),
             Value::Text(v) => write!(f, "{}", v),
             Value::Blob(v) => write!(f, "{:?}", v),
         }
