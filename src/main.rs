@@ -72,7 +72,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-struct Sqlite {
+pub struct Sqlite {
     file: Mmap,
     header: DbHeader,
     pages: Box<[LazyPage]>,

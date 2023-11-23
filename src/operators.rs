@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::{
     btree::LeafTableCell,
-    record::{Cursor, Printer},
+    record::{Cursor, FilterCursor, Printer},
     values::{Typ, Val},
     Sqlite,
 };
@@ -31,11 +31,9 @@ pub trait Operator {
         Self: Sized,
     {
         FilterOp {
-            column,
-            value,
             compare,
             op: self,
-            row_matches: false,
+            cursor: FilterCursor::new(column, value),
         }
     }
 
@@ -189,74 +187,18 @@ impl<'a> Operator for Select<'a> {
 }
 
 pub struct FilterOp<'a, T> {
-    column: usize,
-    value: &'a Val,
     compare: Op,
     op: T,
-    row_matches: bool,
+    cursor: FilterCursor<'a>,
 }
 
 impl<'a, T: Operator> Operator for FilterOp<'a, T> {
     fn execute(&mut self, cell: &LeafTableCell) {
-        cell.payload.consume_one(self.column, &mut *self);
-        if std::mem::take(&mut self.row_matches) {
-            self.op.execute(cell);
-        }
-    }
-
-    fn finish(self) {
-        self.op.finish()
-    }
-}
-
-impl<'a, T: Operator> Cursor<'static> for FilterOp<'a, T> {
-    fn read_next(&mut self, index: usize, typ: Typ) -> bool {
-        if self.column == index {
-            assert_eq!(
-                self.value.typ(),
-                typ,
-                "Cannot compare {:?} and {:?}",
-                self.value,
-                typ
-            );
-            true
-        } else {
-            false
-        }
-    }
-
-    fn on_null(&mut self) {
-        self.matches(&())
-    }
-
-    fn on_bool(&mut self, value: bool) {
-        self.matches(&value)
-    }
-
-    fn on_int(&mut self, value: i64) {
-        self.matches(&value)
-    }
-
-    fn on_float(&mut self, value: f64) {
-        self.matches(&value)
-    }
-
-    fn on_text(&mut self, value: &str) {
-        self.matches(value)
-    }
-
-    fn on_blob(&mut self, value: &[u8]) {
-        self.matches(value)
-    }
-}
-
-impl<'a, T> FilterOp<'a, T> {
-    fn matches<X: ?Sized>(&mut self, value: &X)
-    where
-        Val: std::cmp::PartialOrd<X>,
-    {
-        let cmp = self.value.partial_cmp(value).unwrap();
-        self.row_matches = match self.compare {
+        let cmp = cell
+            .payload
+            .consume_one(self.cursor.column, &mut self.cursor)
+            .result;
+        let filter_matches = match self.compare {
             Op::Eq => cmp == Ordering::Equal,
             Op::Ne => cmp != Ordering::Equal,
             Op::Lt => cmp == Ordering::Less,
@@ -264,5 +206,12 @@ impl<'a, T> FilterOp<'a, T> {
             Op::Gt => cmp == Ordering::Greater,
             Op::Ge => cmp != Ordering::Less,
         };
+        if filter_matches {
+            self.op.execute(cell);
+        }
+    }
+
+    fn finish(self) {
+        self.op.finish()
     }
 }

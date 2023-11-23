@@ -191,7 +191,7 @@ impl<'a, T: Cursor<'a>> Cursor<'a> for &mut T {
 }
 
 pub struct FilterCursor<'a> {
-    column: usize,
+    pub column: usize,
     value: &'a Val,
     pub result: Ordering,
 }
@@ -216,12 +216,11 @@ impl<'a> FilterCursor<'a> {
 impl<'a> Cursor<'a> for FilterCursor<'a> {
     fn read_next(&mut self, index: usize, typ: Typ) -> bool {
         if self.column == index {
-            assert_eq!(
-                self.value.typ(),
+            assert!(
+                self.value.typ().comparable(typ),
+                "Cannot compare a value of type {:?} to {:?}",
                 typ,
-                "Cannot compare {:?} and {:?}",
-                self.value,
-                typ
+                self.value
             );
             true
         } else {

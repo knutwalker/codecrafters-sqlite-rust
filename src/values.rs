@@ -10,6 +10,15 @@ pub enum Typ {
     Blob,
 }
 
+impl Typ {
+    pub fn comparable(self, rhs: Self) -> bool {
+        match (self, rhs) {
+            (Self::Null, _) | (_, Self::Null) => true,
+            _ => std::mem::discriminant(&self) == std::mem::discriminant(&rhs),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Val {
     #[default]
@@ -48,6 +57,7 @@ impl PartialOrd<bool> for Val {
     fn partial_cmp(&self, other: &bool) -> Option<Ordering> {
         match self {
             Val::Bool(val) => val.partial_cmp(other),
+            Val::Null => Some(Ordering::Less),
             _ => None,
         }
     }
@@ -66,6 +76,7 @@ impl PartialOrd<i64> for Val {
     fn partial_cmp(&self, other: &i64) -> Option<Ordering> {
         match self {
             Val::Int(val) => val.partial_cmp(other),
+            Val::Null => Some(Ordering::Less),
             _ => None,
         }
     }
@@ -84,6 +95,7 @@ impl PartialOrd<f64> for Val {
     fn partial_cmp(&self, other: &f64) -> Option<Ordering> {
         match self {
             Val::Float(val) => Some(val.0.total_cmp(other)),
+            Val::Null => Some(Ordering::Less),
             _ => None,
         }
     }
@@ -102,6 +114,7 @@ impl PartialOrd<str> for Val {
     fn partial_cmp(&self, other: &str) -> Option<Ordering> {
         match self {
             Val::Text(val) => val.as_str().partial_cmp(other),
+            Val::Null => Some(Ordering::Less),
             _ => None,
         }
     }
@@ -115,7 +128,7 @@ impl PartialEq<[u8]> for Val {
 
 impl PartialOrd<[u8]> for Val {
     fn partial_cmp(&self, _other: &[u8]) -> Option<Ordering> {
-        None
+        (matches!(self, Val::Null)).then_some(Ordering::Less)
     }
 }
 
