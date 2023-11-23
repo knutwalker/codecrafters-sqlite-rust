@@ -4,6 +4,7 @@ use crate::{
     btree::LeafTableCell,
     record::{Cursor, Printer},
     values::{Typ, Val},
+    Sqlite,
 };
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -37,6 +38,18 @@ pub trait Operator {
             row_matches: false,
         }
     }
+
+    fn seek(
+        &mut self,
+        db: &mut Sqlite,
+        root_page: usize,
+        key: u64,
+        seek: impl Fn(&mut Sqlite, usize, u64, &mut Self),
+    ) where
+        Self: Sized,
+    {
+        seek(db, root_page, key, self)
+    }
 }
 
 impl<T: Operator> Operator for &mut T {
@@ -55,6 +68,16 @@ impl Operator for Count {
 
     fn finish(self) {
         println!("{}", self.0);
+    }
+
+    fn seek(
+        &mut self,
+        _db: &mut Sqlite,
+        _root_page: usize,
+        _key: u64,
+        _seek: impl Fn(&mut Sqlite, usize, u64, &mut Self),
+    ) {
+        self.0 += 1;
     }
 }
 
@@ -146,6 +169,22 @@ impl<'a> Operator for Select<'a> {
         }
 
         println!();
+    }
+
+    fn seek(
+        &mut self,
+        db: &mut Sqlite,
+        root_page: usize,
+        key: u64,
+        seek: impl Fn(&mut Sqlite, usize, u64, &mut Self),
+    ) where
+        Self: Sized,
+    {
+        if self.0.is_empty() && self.1 .1 {
+            println!("{}", key);
+        } else {
+            seek(db, root_page, key, self);
+        }
     }
 }
 
