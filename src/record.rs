@@ -41,7 +41,7 @@ impl LazyRecord {
         Self { bytes, header }
     }
 
-    pub fn consume<'a>(&self, mut cursor: impl Cursor<'a>) {
+    pub fn consume<'a>(&self, mut visitor: impl Visitor<'a>) {
         let mut payload = unsafe { self.bytes.add(self.header) };
         let mut header = unsafe { std::slice::from_raw_parts(self.bytes, self.header) };
 
@@ -49,14 +49,14 @@ impl LazyRecord {
 
         while !header.is_empty() {
             let (serial_type, next_header, _) = read_varint(header);
-            let payload_size = read(serial_type, &mut cursor, index, payload);
+            let payload_size = read(serial_type, &mut visitor, index, payload);
             header = next_header;
             payload = unsafe { payload.add(payload_size) };
             index += 1;
         }
     }
 
-    pub fn consume_one<'a, C: Cursor<'a>>(&self, index: usize, mut cursor: C) -> C {
+    pub fn consume_one<'a, C: Visitor<'a>>(&self, index: usize, mut visitor: C) -> C {
         let mut header = unsafe { std::slice::from_raw_parts(self.bytes, self.header) };
         let bytes = unsafe { self.bytes.add(self.header) };
 
@@ -71,47 +71,47 @@ impl LazyRecord {
         }
 
         let (serial_type, _, _) = read_varint(header);
-        read(serial_type, &mut cursor, index, unsafe {
+        read(serial_type, &mut visitor, index, unsafe {
             self.bytes.add(self.header + payload_offset)
         });
 
-        cursor
+        visitor
     }
 }
 
 fn read<'a>(
     serial_type: u64,
-    mut cursor: impl Cursor<'a>,
+    mut visitor: impl Visitor<'a>,
     index: usize,
     bytes: *const u8,
 ) -> usize {
     match serial_type {
         0 => {
-            if cursor.read_next(index, Typ::Null) {
-                cursor.on_null()
+            if visitor.read_next(index, Typ::Null) {
+                visitor.on_null()
             }
             0
         }
-        1 => read_int::<1>(bytes, index, cursor),
-        2 => read_int::<2>(bytes, index, cursor),
-        3 => read_int::<3>(bytes, index, cursor),
-        4 => read_int::<4>(bytes, index, cursor),
-        5 => read_int::<6>(bytes, index, cursor),
-        6 => read_int::<8>(bytes, index, cursor),
-        7 => read_float(bytes, index, cursor),
+        1 => read_int::<1>(bytes, index, visitor),
+        2 => read_int::<2>(bytes, index, visitor),
+        3 => read_int::<3>(bytes, index, visitor),
+        4 => read_int::<4>(bytes, index, visitor),
+        5 => read_int::<6>(bytes, index, visitor),
+        6 => read_int::<8>(bytes, index, visitor),
+        7 => read_float(bytes, index, visitor),
         8 | 9 => {
-            if cursor.read_next(index, Typ::Bool) {
-                cursor.on_bool(serial_type == 9)
+            if visitor.read_next(index, Typ::Bool) {
+                visitor.on_bool(serial_type == 9)
             }
             0
         }
         10 | 11 => panic!("Cannot read from an internal serial type: {}", serial_type),
         _ => {
             let len = ((serial_type >> 1) - 6) as usize;
-            if serial_type & 0x1 == 0x1 && cursor.read_next(index, Typ::Text) {
-                cursor.on_text(unsafe { from_utf8_unchecked(from_raw_parts(bytes, len)) })
-            } else if cursor.read_next(index, Typ::Blob) {
-                cursor.on_blob(unsafe { from_raw_parts(bytes, len) })
+            if serial_type & 0x1 == 0x1 && visitor.read_next(index, Typ::Text) {
+                visitor.on_text(unsafe { from_utf8_unchecked(from_raw_parts(bytes, len)) })
+            } else if visitor.read_next(index, Typ::Blob) {
+                visitor.on_blob(unsafe { from_raw_parts(bytes, len) })
             }
             len
         }
@@ -121,28 +121,28 @@ fn read<'a>(
 fn read_int<'a, const LEN: usize>(
     bytes: *const u8,
     index: usize,
-    mut cursor: impl Cursor<'a>,
+    mut visitor: impl Visitor<'a>,
 ) -> usize {
-    if cursor.read_next(index, Typ::Int) {
+    if visitor.read_next(index, Typ::Int) {
         let mut data = [0; 8];
         data[8 - LEN..].copy_from_slice(unsafe { from_raw_parts(bytes, LEN) });
         let value = i64::from_be_bytes(data);
-        cursor.on_int(value)
+        visitor.on_int(value)
     }
     LEN
 }
 
-fn read_float<'a>(bytes: *const u8, index: usize, mut cursor: impl Cursor<'a>) -> usize {
-    if cursor.read_next(index, Typ::Float) {
+fn read_float<'a>(bytes: *const u8, index: usize, mut visitor: impl Visitor<'a>) -> usize {
+    if visitor.read_next(index, Typ::Float) {
         let data: [u8; 8] = unsafe { from_raw_parts(bytes, 8) }.try_into().unwrap();
         let value = f64::from_be_bytes(data);
-        cursor.on_float(value)
+        visitor.on_float(value)
     }
     8
 }
 
 #[allow(unused_variables)]
-pub trait Cursor<'a> {
+pub trait Visitor<'a> {
     fn read_next(&mut self, index: usize, typ: Typ) -> bool {
         true
     }
@@ -160,7 +160,7 @@ pub trait Cursor<'a> {
     fn on_blob(&mut self, value: &'a [u8]) {}
 }
 
-impl<'a, T: Cursor<'a>> Cursor<'a> for &mut T {
+impl<'a, T: Visitor<'a>> Visitor<'a> for &mut T {
     fn read_next(&mut self, index: usize, typ: Typ) -> bool {
         (**self).read_next(index, typ)
     }
@@ -190,13 +190,13 @@ impl<'a, T: Cursor<'a>> Cursor<'a> for &mut T {
     }
 }
 
-pub struct FilterCursor<'a> {
+pub struct FilterVisitor<'a> {
     pub column: usize,
     value: &'a Val,
     pub result: Ordering,
 }
 
-impl<'a> FilterCursor<'a> {
+impl<'a> FilterVisitor<'a> {
     pub fn new(column: usize, value: &'a Val) -> Self {
         Self {
             column,
@@ -213,7 +213,7 @@ impl<'a> FilterCursor<'a> {
     }
 }
 
-impl<'a> Cursor<'a> for FilterCursor<'a> {
+impl<'a> Visitor<'a> for FilterVisitor<'a> {
     fn read_next(&mut self, index: usize, typ: Typ) -> bool {
         if self.column == index {
             assert!(
@@ -265,7 +265,7 @@ impl<'a> ReadText<'a> {
     }
 }
 
-impl<'a> Cursor<'a> for ReadText<'a> {
+impl<'a> Visitor<'a> for ReadText<'a> {
     fn on_text(&mut self, value: &'a str) {
         self.0 = Some(value);
     }
@@ -283,7 +283,7 @@ impl ReadInt {
     }
 }
 
-impl Cursor<'static> for ReadInt {
+impl Visitor<'static> for ReadInt {
     fn on_int(&mut self, value: i64) {
         self.0 = Some(value);
     }
@@ -291,7 +291,7 @@ impl Cursor<'static> for ReadInt {
 
 pub struct Printer;
 
-impl Cursor<'static> for Printer {
+impl Visitor<'static> for Printer {
     fn on_bool(&mut self, value: bool) {
         print!("{}", value);
     }
@@ -315,7 +315,7 @@ impl Cursor<'static> for Printer {
 
 struct IgnoreAll;
 
-impl Cursor<'static> for IgnoreAll {
+impl Visitor<'static> for IgnoreAll {
     fn read_next(&mut self, _index: usize, _typ: Typ) -> bool {
         false
     }

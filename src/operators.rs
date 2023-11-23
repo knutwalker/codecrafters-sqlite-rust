@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 
 use crate::{
     btree::LeafTableCell,
-    record::{Cursor, FilterCursor, Printer},
+    record::{FilterVisitor, Printer, Visitor},
     values::{Typ, Val},
     Sqlite,
 };
@@ -33,7 +33,7 @@ pub trait Operator {
         FilterOp {
             compare,
             op: self,
-            cursor: FilterCursor::new(column, value),
+            visitor: FilterVisitor::new(column, value),
         }
     }
 
@@ -102,7 +102,7 @@ impl Operator for SelectAll {
     }
 }
 
-impl Cursor<'static> for SelectAll {
+impl Visitor<'static> for SelectAll {
     fn read_next(&mut self, index: usize, typ: Typ) -> bool {
         if index > 0 {
             print!("|");
@@ -189,14 +189,14 @@ impl<'a> Operator for Select<'a> {
 pub struct FilterOp<'a, T> {
     compare: Op,
     op: T,
-    cursor: FilterCursor<'a>,
+    visitor: FilterVisitor<'a>,
 }
 
 impl<'a, T: Operator> Operator for FilterOp<'a, T> {
     fn execute(&mut self, cell: &LeafTableCell) {
         let cmp = cell
             .payload
-            .consume_one(self.cursor.column, &mut self.cursor)
+            .consume_one(self.visitor.column, &mut self.visitor)
             .result;
         let filter_matches = match self.compare {
             Op::Eq => cmp == Ordering::Equal,

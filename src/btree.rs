@@ -2,7 +2,7 @@ use std::{cmp::Ordering, ops::Deref};
 
 use crate::{
     page::{CellType, Cells, LazyCells},
-    record::{read_varint, FilterCursor, LazyRecord, ReadInt},
+    record::{read_varint, FilterVisitor, LazyRecord, ReadInt},
     values::Val,
 };
 
@@ -73,7 +73,9 @@ impl LeafIndexCell {
     }
 
     fn compare(&self, lhs: &Val) -> Ordering {
-        self.record.consume_one(0, FilterCursor::new(0, lhs)).result
+        self.record
+            .consume_one(0, FilterVisitor::new(0, lhs))
+            .result
     }
 
     pub fn row_id(&self) -> u64 {
