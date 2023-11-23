@@ -293,10 +293,6 @@ impl Cursor<'static> for ReadInt {
 pub struct Printer;
 
 impl Cursor<'static> for Printer {
-    fn on_null(&mut self) {
-        print!("NULL");
-    }
-
     fn on_bool(&mut self, value: bool) {
         print!("{}", value);
     }
