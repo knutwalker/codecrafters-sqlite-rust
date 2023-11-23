@@ -2,8 +2,8 @@ use std::{cmp::Ordering, ops::Deref};
 
 use crate::{
     page::{CellType, Cells, LazyCells},
-    record::{read_varint, LazyRecord},
-    values::{Val, Value},
+    record::{read_varint, FilterCursor, LazyRecord, ReadInt},
+    values::Val,
 };
 
 pub type LeafTablePage = Cells<LeafTableCell>;
@@ -52,25 +52,14 @@ impl CellType for LeafTableCell {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LeafIndexCell {
-    value: Value,
-    pub row_id: u64,
+    record: LazyRecord,
 }
 
 impl CellType for LeafIndexCell {
     fn new(bytes: &[u8]) -> Self {
         let (_payload_size, bytes, _) = read_varint(bytes);
         let payload = LazyRecord::new(bytes);
-
-        let mut values = payload.values();
-        let value = values.next().expect("Missing value for index payload");
-        let Some(Value::Int(row_id)) = values.next() else {
-            panic!("Missing row id for index payload");
-        };
-
-        Self {
-            value,
-            row_id: row_id as u64,
-        }
+        Self { record: payload }
     }
 }
 
@@ -84,15 +73,14 @@ impl LeafIndexCell {
     }
 
     fn compare(&self, lhs: &Val) -> Ordering {
-        let rhs = self.value();
-        match lhs.partial_cmp(&rhs) {
-            Some(cmp) => cmp,
-            None => panic!("Cannot compare {:?} and {:?}", lhs, rhs),
-        }
+        self.record.consume_one(0, FilterCursor::new(0, lhs)).result
     }
 
-    pub fn value(&self) -> Value {
-        self.value
+    pub fn row_id(&self) -> u64 {
+        self.record
+            .consume_one(1, ReadInt::new())
+            .get()
+            .expect("row_id is always an int value") as u64
     }
 }
 

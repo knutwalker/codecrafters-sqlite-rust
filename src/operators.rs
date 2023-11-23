@@ -1,6 +1,10 @@
 use std::cmp::Ordering;
 
-use crate::{btree::LeafTableCell, values::Val};
+use crate::{
+    btree::LeafTableCell,
+    record::{Cursor, Printer},
+    values::{Typ, Val},
+};
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum Op {
@@ -30,6 +34,7 @@ pub trait Operator {
             value,
             compare,
             op: self,
+            row_matches: false,
         }
     }
 }
@@ -56,31 +61,60 @@ impl Operator for Count {
 #[derive(Debug)]
 pub struct SelectAll {
     primary_key: usize,
+    row_id: u64,
 }
 
 impl SelectAll {
     pub fn new(primary_key: usize) -> Self {
-        Self { primary_key }
+        Self {
+            primary_key,
+            row_id: u64::MAX,
+        }
     }
 }
 
 impl Operator for SelectAll {
     fn execute(&mut self, cell: &LeafTableCell) {
-        let pk = self.primary_key;
-        let mut index = 0;
-        cell.payload.for_each(|val| {
-            if index > 0 {
-                print!("|");
-            }
-            if index == pk {
-                print!("{}", cell.row_id);
-            } else {
-                print!("{}", val);
-            }
-            index += 1;
-        });
+        self.row_id = cell.row_id;
+        cell.payload.consume(self);
+        println!()
+    }
+}
 
-        println!();
+impl Cursor<'static> for SelectAll {
+    fn read_next(&mut self, index: usize, typ: Typ) -> bool {
+        if index > 0 {
+            print!("|");
+        }
+        if index == self.primary_key && typ == Typ::Null {
+            print!("{}", self.row_id);
+            return false;
+        }
+        true
+    }
+
+    fn on_null(&mut self) {
+        Printer.on_null()
+    }
+
+    fn on_bool(&mut self, value: bool) {
+        Printer.on_bool(value)
+    }
+
+    fn on_int(&mut self, value: i64) {
+        Printer.on_int(value)
+    }
+
+    fn on_float(&mut self, value: f64) {
+        Printer.on_float(value)
+    }
+
+    fn on_text(&mut self, value: &'static str) {
+        Printer.on_text(value)
+    }
+
+    fn on_blob(&mut self, value: &'static [u8]) {
+        Printer.on_blob(value)
     }
 }
 
@@ -97,17 +131,18 @@ impl<'a> Operator for Select<'a> {
     fn execute(&mut self, cell: &LeafTableCell) {
         for &(idx, pk) in self.0 {
             if pk {
-                print!("{}|", cell.row_id);
+                print!("{}", cell.row_id);
             } else {
-                print!("{}|", cell.payload.value_at(idx));
+                cell.payload.consume_one(idx, Printer);
             }
+            print!("|");
         }
 
         let &(idx, pk) = &self.1;
         if pk {
             print!("{}", cell.row_id);
         } else {
-            print!("{}", cell.payload.value_at(idx));
+            cell.payload.consume_one(idx, Printer);
         }
 
         println!();
@@ -119,17 +154,70 @@ pub struct FilterOp<'a, T> {
     value: &'a Val,
     compare: Op,
     op: T,
+    row_matches: bool,
 }
 
 impl<'a, T: Operator> Operator for FilterOp<'a, T> {
     fn execute(&mut self, cell: &LeafTableCell) {
-        let lhs = self.value;
-        let rhs = cell.payload.value_at(self.column);
-        let cmp = match lhs.partial_cmp(&rhs) {
-            Some(cmp) => cmp,
-            None => panic!("Cannot compare {:?} and {:?}", lhs, rhs),
-        };
-        let filter = match self.compare {
+        cell.payload.consume_one(self.column, &mut *self);
+        if std::mem::take(&mut self.row_matches) {
+            self.op.execute(cell);
+        }
+    }
+
+    fn finish(self) {
+        self.op.finish()
+    }
+}
+
+impl<'a, T: Operator> Cursor<'static> for FilterOp<'a, T> {
+    fn read_next(&mut self, index: usize, typ: Typ) -> bool {
+        if self.column == index {
+            assert_eq!(
+                self.value.typ(),
+                typ,
+                "Cannot compare {:?} and {:?}",
+                self.value,
+                typ
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    fn on_null(&mut self) {
+        self.matches(&())
+    }
+
+    fn on_bool(&mut self, value: bool) {
+        self.matches(&value)
+    }
+
+    fn on_int(&mut self, value: i64) {
+        self.matches(&value)
+    }
+
+    fn on_float(&mut self, value: f64) {
+        self.matches(&value)
+    }
+
+    fn on_text(&mut self, value: &str) {
+        self.matches(value)
+    }
+
+    fn on_blob(&mut self, value: &[u8]) {
+        self.matches(value)
+    }
+}
+
+impl<'a, T> FilterOp<'a, T> {
+    fn matches<X: ?Sized>(&mut self, value: &X)
+    where
+        Val: std::cmp::PartialOrd<X>,
+    {
+        let cmp = self.value.partial_cmp(value).unwrap();
+        self.row_matches = match self.compare {
             Op::Eq => cmp == Ordering::Equal,
             Op::Ne => cmp != Ordering::Equal,
             Op::Lt => cmp == Ordering::Less,
@@ -137,12 +225,5 @@ impl<'a, T: Operator> Operator for FilterOp<'a, T> {
             Op::Gt => cmp == Ordering::Greater,
             Op::Ge => cmp != Ordering::Less,
         };
-        if filter {
-            self.op.execute(cell);
-        }
-    }
-
-    fn finish(self) {
-        self.op.finish()
     }
 }

@@ -10,7 +10,7 @@ use nom::{
 };
 use std::ops::Deref;
 
-use crate::record::LazyRecord;
+use crate::record::{LazyRecord, ReadInt, ReadText};
 
 #[derive(Debug, PartialEq)]
 pub struct Schema {
@@ -19,46 +19,47 @@ pub struct Schema {
 
 impl Schema {
     pub fn typ(&self) -> TableType {
-        let Some(typ) = self.record.value_at(0).as_text() else {
-            unreachable!("type is always a text value")
-        };
-
-        match TableType::from_text(typ) {
-            Ok(typ) => typ,
-            Err(e) => panic!("Invalid table type: {}", e),
-        }
+        TableType::from_text(
+            self.record
+                .consume_one(0, ReadText::new())
+                .get()
+                .expect("type is always a text value"),
+        )
+        .expect("type is always a valid table type")
     }
 
     pub fn table_name(&self) -> &str {
-        let Some(table_name) = self.record.value_at(2).as_text() else {
-            unreachable!("table_name is always a text value")
-        };
-
-        table_name
+        self.record
+            .consume_one(2, ReadText::new())
+            .get()
+            .expect("table_name is always a text value")
     }
 
     pub fn table_def(&self) -> Result<TableDef<'_>> {
-        let Some(sql) = self.record.value_at(4).as_text() else {
-            unreachable!("sql is always a text value")
-        };
-
-        TableDef::from_sql(sql)
+        TableDef::from_sql(
+            self.record
+                .consume_one(4, ReadText::new())
+                .get()
+                .expect("sql is always a text value"),
+        )
     }
 
     pub fn index_def(&self) -> Result<IndexDef<'_>> {
-        let Some(sql) = self.record.value_at(4).as_text() else {
-            unreachable!("sql is always a text value")
-        };
-
-        IndexDef::from_sql(sql)
+        IndexDef::from_sql(
+            self.record
+                .consume_one(4, ReadText::new())
+                .get()
+                .expect("sql is always a text value"),
+        )
     }
 
     pub fn root_page(&self) -> usize {
-        let Some(root_page) = self.record.value_at(3).as_int() else {
-            unreachable!("root_page is always an int value")
-        };
-
-        root_page as usize - 1
+        let page = self
+            .record
+            .consume_one(3, ReadInt::new())
+            .get()
+            .expect("root_page is always an int value");
+        page as usize - 1
     }
 
     pub fn from_record(record: LazyRecord) -> Self {

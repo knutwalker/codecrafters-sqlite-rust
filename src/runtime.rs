@@ -97,7 +97,7 @@ fn page_index_scan(
             let upper = page.partition_point(|cell| cell.upper_bound(condition));
 
             for cell in page.slice(lower..upper) {
-                seek(db, table_root, cell.row_id, operator);
+                seek(db, table_root, cell.row_id(), operator);
             }
         }
         Page::InteriorIndex(page) => {
@@ -107,7 +107,7 @@ fn page_index_scan(
             let right_ptr = page.get(upper).map_or(page.right_ptr, |cell| cell.left_ptr);
 
             for page in page.slice(lower..upper) {
-                let row_id = page.row_id;
+                let row_id = page.row_id();
                 page_index_scan(db, table_root, page.left_ptr as usize, condition, operator);
 
                 seek(db, table_root, row_id, operator);
